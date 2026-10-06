@@ -141,6 +141,48 @@ describe("exports", () => {
       expect(r.bytes, `${fmt} export should be non-empty`).toBeGreaterThan(0);
     }
   });
+
+  it("writes the clean translation alongside the verification report", async () => {
+    const a = await runDoc("translation.txt");
+    const report = run.loadReport(a.id);
+    expect(report).not.toBeNull();
+    const exportInput = {
+      docId: a.id,
+      fileName: "translation.txt",
+      blocks: run.loadBlocks(a.id),
+      report: report!,
+      companyName: "Gujarat Co-operative Bank",
+    };
+    const written: string[] = [];
+    for (const fmt of ["txt", "pdf", "docx"] as const) {
+      const r = await exportDoc.exportDocument(exportInput, fmt, "translation");
+      expect(r.bytes, `${fmt} translation should be non-empty`).toBeGreaterThan(0);
+      written.push(r.path);
+    }
+    // Different filenames: a re-export of one kind must not clobber the other.
+    expect(new Set(written).size).toBe(written.length);
+    expect(written.every((p) => p.includes("english-translation"))).toBe(true);
+  });
+
+  it("keeps an operator-supplied company name over the detected one", () => {
+    const id = run.createDocument({
+      fileName: "named.txt",
+      mime: "text/plain",
+      sizeBytes: 4,
+      companyName: "State Bank of India",
+    });
+    expect(run.getCompanyName(id)).toBe("State Bank of India");
+    // Auto-detection must not overwrite what the operator typed.
+    expect(run.resolveCompanyName(id, "Some Other Bank Limited")).toBe("State Bank of India");
+    expect(run.getCompanyName(id)).toBe("State Bank of India");
+  });
+
+  it("stores the detected company when no override was given", () => {
+    const id = run.createDocument({ fileName: "auto.txt", mime: "text/plain", sizeBytes: 4 });
+    expect(run.getCompanyName(id)).toBe("");
+    expect(run.resolveCompanyName(id, "Kotak Mahindra Bank Limited")).toBe("Kotak Mahindra Bank Limited");
+    expect(run.getCompanyName(id)).toBe("Kotak Mahindra Bank Limited");
+  });
 });
 
 describe("ambiguous dates across the boundary", () => {

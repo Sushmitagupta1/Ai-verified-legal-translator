@@ -5,6 +5,7 @@ import { config, ensureDirs } from "../config";
 import { all, get, run, tx } from "../db";
 import { docTypeLabel, preflightDocument, type Block, type Datum, type Finding } from "../domain";
 import { normalizeWhitespace } from "../domain/gujarati";
+import { detectReportPattern } from "../domain/letterhead";
 import { createLlmClient, providerDisplayName } from "../llm";
 import type { LlmClient } from "../llm/provider";
 import { describeBackends } from "./backends";
@@ -134,6 +135,10 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   }
 
   report("structured", `Detected ${prepared.detection.type}`, 25);
+
+  // Who the report is addressed to: an override from upload wins, otherwise the
+  // name read off the document's addressee or letterhead.
+  resolveCompanyName(opts.documentId, detectReportPattern(prepared.blocks).companyName);
 
   // ── Preflight gate ─────────────────────────────────────────────────────────
   // Hard stop. Translating Devanagari or a legacy-encoded Gujarati font through
@@ -553,7 +558,11 @@ function persistReport(documentId: string, report: VerificationReport): void {
   const now = new Date().toISOString();
   tx(() => {
     run("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at", `report:${documentId}`, JSON.stringify(report), now);
-    run("UPDATE documents SET status = 'ready', stage = 'ready', updated_at = ? WHERE id = ?", now, documentId);
+    run(
+      "UPDATE documents SET status = 'ready', stage = 'ready', error = NULL, updated_at = ? WHERE id = ?",
+      now,
+      documentId,
+    );
     log(documentId, "reported", `report generated (${report.fidelityIndicator.grade})`);
   });
 }
@@ -581,23 +590,53 @@ export function createDocument(input: {
   mime: string;
   sizeBytes: number;
   declaredType?: string | null;
+  /** Operator-supplied company name; wins over the one detected in the file. */
+  companyName?: string | null;
 }): string {
   const id = `d-${randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
   const stored = `${id}${path.extname(input.fileName) || ".bin"}`;
   run(
-    `INSERT INTO documents (id, file_name, stored_name, mime, size_bytes, sha256, declared_type, status, stage, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, '', ?, 'uploaded', 'uploaded', ?, ?)`,
+    `INSERT INTO documents (id, file_name, stored_name, mime, size_bytes, sha256, declared_type, company_name, status, stage, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, '', ?, ?, 'uploaded', 'uploaded', ?, ?)`,
     id,
     input.fileName,
     stored,
     input.mime,
     input.sizeBytes,
     input.declaredType ?? null,
+    input.companyName?.trim() || null,
     now,
     now,
   );
   return id;
+}
+
+/**
+ * Record the company name the report is addressed to.
+ *
+ * An operator override supplied at upload always wins; otherwise the name
+ * detected from the document's addressee/letterhead is stored so every later
+ * reader (exports, UI) sees one resolved value.
+ */
+export function resolveCompanyName(documentId: string, detected: string): string {
+  const stored = get<{ company_name: string | null }>(
+    "SELECT company_name FROM documents WHERE id = ?",
+    documentId,
+  )?.company_name;
+  const override = stored?.trim() ?? "";
+  const resolved = override || detected.trim();
+  if (resolved && resolved !== stored) {
+    run("UPDATE documents SET company_name = ?, updated_at = ? WHERE id = ?", resolved, new Date().toISOString(), documentId);
+  }
+  return resolved;
+}
+
+export function getCompanyName(documentId: string): string {
+  return (
+    get<{ company_name: string | null }>("SELECT company_name FROM documents WHERE id = ?", documentId)?.company_name?.trim() ??
+    ""
+  );
 }
 
 function log(documentId: string, action: string, detail: string): void {

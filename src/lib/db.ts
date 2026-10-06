@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS documents (
   target_lang        TEXT NOT NULL DEFAULT 'en',
   declared_type      TEXT,
   detected_type      TEXT,
+  company_name       TEXT,
   type_confidence    REAL,
   page_count         INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL DEFAULT 'uploaded',
@@ -217,7 +218,30 @@ export function db(): DatabaseSync {
   fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
   _db = new DatabaseSync(config.dbPath);
   _db.exec(SCHEMA);
+  migrate(_db);
   return _db;
+}
+
+/**
+ * Columns added after the first release.
+ *
+ * SQLite has no "ADD COLUMN IF NOT EXISTS", so each statement runs once and is
+ * expected to fail with "duplicate column name" on the next start. A fresh
+ * database already has the column from SCHEMA, so it fails there too — which is
+ * exactly the no-op we want.
+ */
+const MIGRATIONS: string[] = [
+  "ALTER TABLE documents ADD COLUMN company_name TEXT",
+];
+
+function migrate(d: DatabaseSync): void {
+  for (const sql of MIGRATIONS) {
+    try {
+      d.exec(sql);
+    } catch {
+      // Already applied.
+    }
+  }
 }
 
 export function closeDb(): void {

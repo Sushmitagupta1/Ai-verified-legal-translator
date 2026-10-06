@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { NextResponse } from "next/server";
 import { get } from "@/lib/db";
-import { exportDocument, type ExportFormat } from "@/lib/pipeline/export";
+import { exportDocument, type ExportFormat, type ExportKind } from "@/lib/pipeline/export";
 import { loadBlocks, loadReport } from "@/lib/pipeline/run";
 
 export const runtime = "nodejs";
@@ -15,7 +15,7 @@ const CONTENT_TYPES: Record<ExportFormat, string> = {
 };
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string; fmt: string }> },
 ) {
   const { id, fmt } = await params;
@@ -23,8 +23,11 @@ export async function GET(
     return NextResponse.json({ error: "format must be pdf, docx or txt" }, { status: 400 });
   }
 
-  const document = get<{ file_name: string }>(
-    `SELECT file_name FROM documents WHERE id = ?`,
+  const kindParam = new URL(req.url).searchParams.get("kind");
+  const kind: ExportKind = kindParam === "translation" ? "translation" : "verification";
+
+  const document = get<{ file_name: string; company_name: string | null }>(
+    `SELECT file_name, company_name FROM documents WHERE id = ?`,
     id,
   );
   if (!document) return NextResponse.json({ error: "not found" }, { status: 404 });
@@ -40,8 +43,15 @@ export async function GET(
   try {
     const format = fmt as ExportFormat;
     const result = await exportDocument(
-      { docId: id, fileName: document.file_name, blocks: loadBlocks(id), report },
+      {
+        docId: id,
+        fileName: document.file_name,
+        blocks: loadBlocks(id),
+        report,
+        companyName: document.company_name ?? "",
+      },
       format,
+      kind,
     );
     const bytes = fs.readFileSync(result.path);
     const base = path
@@ -51,7 +61,7 @@ export async function GET(
     return new NextResponse(new Uint8Array(bytes), {
       headers: {
         "Content-Type": CONTENT_TYPES[format],
-        "Content-Disposition": `attachment; filename="${base}-verification-report.${format}"`,
+        "Content-Disposition": `attachment; filename="${base}-${kind === "translation" ? "english-translation" : "verification-report"}.${format}"`,
         "Content-Length": String(bytes.length),
       },
     });

@@ -54,6 +54,7 @@ export default function HomePage() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [declaredType, setDeclaredType] = useState("");
+  const [companyName, setCompanyName] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -96,6 +97,7 @@ export default function HomePage() {
       const form = new FormData();
       form.set("file", file);
       if (declaredType) form.set("type", declaredType);
+      if (companyName.trim()) form.set("companyName", companyName.trim());
       const res = await fetch("/api/documents", { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Upload failed.");
@@ -126,6 +128,15 @@ export default function HomePage() {
                   <option value="notice">Notice</option>
                   <option value="power_of_attorney">Power of attorney</option>
                 </select>
+              </label>
+              <label className="field">
+                Company / addressee name
+                <input
+                  type="text"
+                  value={companyName}
+                  onChange={(e) => setCompanyName(e.target.value)}
+                  placeholder="Auto-detect if left blank"
+                />
               </label>
               <button type="submit" disabled={uploading} style={{ marginTop: 16 }}>
                 {uploading ? "Uploading…" : "Upload"}

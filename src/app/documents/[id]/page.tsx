@@ -278,6 +278,20 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
             </a>
           </div>
         ) : null}
+
+        {finished && !running && doc.status !== "failed" ? (
+          <div className="row" style={{ marginTop: 8 }}>
+            <a className="btn ghost" href={`/api/documents/${id}/export/txt?kind=translation`}>
+              Translation .txt
+            </a>
+            <a className="btn ghost" href={`/api/documents/${id}/export/pdf?kind=translation`}>
+              Translation .pdf
+            </a>
+            <a className="btn ghost" href={`/api/documents/${id}/export/docx?kind=translation`}>
+              Translation .docx
+            </a>
+          </div>
+        ) : null}
       </div>
 
       {report ? (

@@ -24,6 +24,7 @@ interface DocumentSummary {
   size_bytes: number;
   declared_type: string | null;
   detected_type: string | null;
+  company_name: string | null;
   type_confidence: number | null;
   page_count: number;
   status: string;
@@ -39,7 +40,7 @@ interface DocumentSummary {
 export async function GET() {
   ensureDirs();
   const documents = all<DocumentSummary>(
-    `SELECT id, file_name, mime, size_bytes, declared_type, detected_type, type_confidence,
+    `SELECT id, file_name, mime, size_bytes, declared_type, detected_type, company_name, type_confidence,
             page_count, status, stage, fidelity, fidelity_band, gate_status, error,
             created_at, updated_at
        FROM documents
@@ -80,6 +81,9 @@ export async function POST(req: NextRequest) {
     const declared = form.get("type");
     const declaredType = typeof declared === "string" && declared.trim() ? declared.trim() : null;
 
+    const company = form.get("companyName");
+    const companyName = typeof company === "string" && company.trim() ? company.trim() : null;
+
     ensureDirs();
     const buffer = Buffer.from(await file.arrayBuffer());
     const id = createDocument({
@@ -87,6 +91,7 @@ export async function POST(req: NextRequest) {
       mime,
       sizeBytes: buffer.length,
       declaredType,
+      companyName,
     });
 
     const stored =

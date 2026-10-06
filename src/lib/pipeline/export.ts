@@ -4,6 +4,7 @@ import type PDFKitType from "pdfkit";
 import { config, ensureDirs } from "../config";
 import { DISCLAIMER } from "../domain/glossary";
 import { normalizeWhitespace, transliterateGujarati } from "../domain/gujarati";
+import { detectReportPattern, patternHeader, patternParts, type PatternPart, type ReportPattern } from "../domain/letterhead";
 import type { Block, Finding } from "../domain";
 import type { VerificationReport } from "./report";
 
@@ -14,7 +15,69 @@ export interface ExportInput {
   report: VerificationReport;
   /** Findings keyed by block id for inline annotation. */
   findingsByBlock?: Map<string, Finding[]>;
+  /**
+   * Resolved company/addressee name the report is addressed to. Supplied by the
+   * operator at upload or detected from the document; see `resolveCompanyName`.
+   */
+  companyName?: string;
 }
+
+/** Which document is being produced: the review report or the clean translation. */
+export type ExportKind = "verification" | "translation";
+
+type RenderRole = "h1" | "h2" | "p";
+
+function roleOf(b: Block): RenderRole {
+  if (b.kind === "document_title" || b.kind === "heading_1") return "h1";
+  if (b.kind === "heading_2" || b.kind === "heading_3" || b.kind === "table_header") return "h2";
+  return "p";
+}
+
+/** English body text; an untranslated block stays in the source and says so. */
+function englishOf(b: Block): string {
+  const target = normalizeWhitespace(b.targetText ?? "");
+  if (target) return target;
+  return `${normalizeWhitespace(b.sourceText)} [not translated]`;
+}
+
+function patternOf(input: ExportInput): ReportPattern {
+  return detectReportPattern(input.blocks);
+}
+
+function headerOf(input: ExportInput, voice: "source" | "target"): string[] {
+  return patternHeader(patternOf(input), input.companyName ?? "", voice);
+}
+
+function partsOf(input: ExportInput, voice: "source" | "target") {
+  return patternParts(patternOf(input), input.companyName ?? "", voice);
+}
+
+/** The blocks that make up the document body, i.e. everything after the header. */
+function bodyOf(input: ExportInput): Block[] {
+  return input.blocks.slice(patternOf(input).bodyStart).filter((b) => b.kind !== "page_break");
+}
+
+function indicatorLine(r: VerificationReport): string {
+  const i = r.fidelityIndicator;
+  return `${(i.value * 100).toFixed(1)}% (${i.grade.toUpperCase()})`;
+}
+
+/** Closing block carried by every export: indicator, certification status, disclaimer. */
+function closingLines(r: VerificationReport): string[] {
+  return [
+    "=".repeat(78),
+    `Automated quality indicator : ${indicatorLine(r)}`,
+    "Certification status        : NOT CERTIFIED — human review required",
+    "",
+    DISCLAIMER,
+    "",
+    `Source SHA-256 : ${r.sourceSha256}`,
+    `Generated      : ${r.generatedAt}`,
+  ];
+}
+
+const DRAFT_NOTICE =
+  "Machine-generated English draft — NOT CERTIFIED. Human review required before relying on it.";
 
 const SEVERITY_MARK: Record<string, string> = {
   critical: "[CRITICAL]",
@@ -28,6 +91,14 @@ const SEVERITY_MARK: Record<string, string> = {
 export function buildTextExport(input: ExportInput): string {
   const { blocks, report } = input;
   const out: string[] = [];
+
+  // Address the report the way the source document is addressed: its own
+  // letterhead and title, then "To, / The Manager, / <company>".
+  const header = headerOf(input, "source");
+  out.push(...header);
+  if (header.length) {
+    out.push("=".repeat(78));
+  }
 
   out.push("VERIFICATION REPORT — GUJARATI → ENGLISH LEGAL TRANSLATION");
   out.push("=".repeat(78));
@@ -105,6 +176,51 @@ export function buildTextExport(input: ExportInput): string {
   return out.join("\n");
 }
 
+// ── Clean translation ────────────────────────────────────────────────────────
+
+/**
+ * The final deliverable: the English document on its own paper.
+ *
+ * Structure is taken from the source — letterhead, date, report title, addressee
+ * — so what comes out of the pipeline reads like the document it was given, not
+ * like a tool's UI. The certification language moves to the foot, where a real
+ * report carries its disclaimers.
+ */
+export function buildTranslationText(input: ExportInput): string {
+  const out: string[] = [];
+
+  out.push(...headerOf(input, "target"));
+  if (out.length) out.push("");
+  out.push(`--- ${DRAFT_NOTICE} ---`);
+  out.push("");
+
+  let lastRole: RenderRole | null = null;
+  for (const b of bodyOf(input)) {
+    const role = roleOf(b);
+    const text = englishOf(b);
+    if (!text.trim()) continue;
+
+    if (role === "h1") {
+      out.push("");
+      out.push(text.toUpperCase());
+      out.push("-".repeat(Math.min(78, Math.max(8, text.length))));
+      out.push("");
+    } else if (role === "h2") {
+      out.push("");
+      out.push(text);
+      out.push("");
+    } else {
+      out.push(text);
+      if (lastRole === "h2") out.push("");
+    }
+    lastRole = role;
+  }
+
+  out.push("");
+  out.push(...closingLines(input.report));
+  return out.join("\n");
+}
+
 // ── PDF ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -126,6 +242,17 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
   doc.on("data", (c: Buffer) => chunks.push(c));
 
   const W = doc.page.width - 84;
+
+  const header = partsOf(input, "source");
+  if (header.length) {
+    drawPatternHeader(doc, header, W);
+    doc
+      .moveTo(doc.page.margins.left, doc.y)
+      .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+      .strokeColor("#000")
+      .stroke();
+    doc.moveDown(0.6);
+  }
 
   doc.font("Helvetica-Bold").fontSize(15).text("VERIFICATION REPORT", { align: "center" });
   doc.moveDown(0.2);
@@ -249,6 +376,118 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+/**
+ * The clean translation as PDF: source masthead, translated body, certification
+ * notice at the foot.
+ */
+export async function buildTranslationPdf(input: ExportInput): Promise<Buffer> {
+  const PDFDocument = (await import("pdfkit")).default;
+  ensureDirs();
+
+  const doc = new PDFDocument({ size: "A4", margin: 42, bufferPages: true, info: { Title: "English Translation" } });
+  const chunks: Buffer[] = [];
+  doc.on("data", (c: Buffer) => chunks.push(c));
+  const W = doc.page.width - 84;
+
+  const header = partsOf(input, "target");
+  if (header.length) {
+    drawPatternHeader(doc, header, W);
+    doc.moveDown(0.3);
+  }
+
+  doc.font("Helvetica-Oblique").fontSize(8.5).fillColor("#991b1b").text(DRAFT_NOTICE, { align: "center", width: W });
+  doc.moveDown(0.8);
+
+  for (const b of bodyOf(input)) {
+    const role = roleOf(b);
+    const text = englishOf(b);
+    if (!text.trim()) continue;
+    if (doc.y > doc.page.height - 120) doc.addPage();
+
+    if (role === "h1") {
+      doc.moveDown(0.5);
+      doc.font("Helvetica-Bold").fontSize(12).fillColor("#000").text(text.toUpperCase(), { width: W });
+      doc
+        .moveTo(doc.page.margins.left, doc.y)
+        .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+        .strokeColor("#000")
+        .stroke();
+      doc.moveDown(0.4);
+    } else if (role === "h2") {
+      doc.moveDown(0.4);
+      doc.font("Helvetica-Bold").fontSize(10.5).fillColor("#000").text(text, { width: W });
+      doc.moveDown(0.2);
+    } else {
+      doc.font("Helvetica").fontSize(10).fillColor("#111").text(text, { width: W, align: "justify" });
+      doc.moveDown(0.35);
+    }
+  }
+
+  doc.moveDown(0.8);
+  doc
+    .moveTo(doc.page.margins.left, doc.y)
+    .lineTo(doc.page.width - doc.page.margins.right, doc.y)
+    .strokeColor("#000")
+    .stroke();
+  doc.moveDown(0.5);
+
+  const ind = input.report.fidelityIndicator;
+  doc
+    .font("Helvetica-Bold")
+    .fontSize(10)
+    .fillColor(ind.grade === "green" ? "#166534" : ind.grade === "yellow" ? "#92400e" : "#991b1b")
+    .text(`Automated quality indicator: ${indicatorLine(input.report)} — NOT CERTIFIED`, { width: W });
+  doc.moveDown(0.25);
+  doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(DISCLAIMER, { width: W, align: "center" });
+  doc.moveDown(0.25);
+  doc
+    .font("Helvetica")
+    .fontSize(8)
+    .fillColor("#555")
+    .text(`Source SHA-256: ${input.report.sourceSha256}   ·   Generated: ${input.report.generatedAt}`, { width: W });
+
+  const range = doc.bufferedPageRange();
+  for (let i = 0; i < range.count; i++) {
+    doc.switchToPage(range.start + i);
+    doc
+      .font("Helvetica")
+      .fontSize(7.5)
+      .fillColor("#888")
+      .text(`Page ${i + 1} of ${range.count}`, doc.page.width - 140, doc.page.height - 40, { width: 100, align: "right" });
+    doc.text("Nyayadoot — AI translation, not certified", doc.page.margins.left, doc.page.height - 40, { width: 260, align: "left" });
+  }
+
+  doc.end();
+  await new Promise<void>((resolve) => doc.on("end", resolve));
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Draw the source document's own masthead: name in bold, contact lines beneath,
+ * then the report title, then the addressee flush left — the same order a
+ * printed legal report uses.
+ */
+function drawPatternHeader(doc: InstanceType<typeof PDFKitType>, parts: PatternPart[], W: number): void {
+  let firstLetterhead = true;
+  for (const p of parts) {
+    if (p.kind === "letterhead") {
+      doc
+        .font(firstLetterhead ? "Helvetica-Bold" : "Helvetica")
+        .fontSize(firstLetterhead ? 12 : 9)
+        .fillColor("#000")
+        .text(p.text, { align: "center", width: W });
+      firstLetterhead = false;
+    } else if (p.kind === "title") {
+      doc.moveDown(0.3);
+      doc.font("Helvetica-Bold").fontSize(14).fillColor("#000").text(p.text.toUpperCase(), { align: "center", width: W });
+      doc.moveDown(0.3);
+    } else {
+      doc.font("Helvetica").fontSize(10).fillColor("#111").text(p.text, { width: W });
+    }
+  }
+  if (parts.length) doc.moveDown(0.6);
+}
+
 function sectionTitle(doc: InstanceType<typeof PDFKitType>, title: string): void {
   doc.font("Helvetica-Bold").fontSize(13).fillColor("#000").text(title);
   doc.moveDown(0.2);
@@ -279,6 +518,31 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
   // A docx body is a flat list of block-level items, so headings/paragraphs
   // share the array with tables; `File` accepts either.
   const children: Array<InstanceType<typeof Paragraph> | InstanceType<typeof Table>> = [];
+
+  const masthead = partsOf(input, "source");
+  masthead.forEach((p, i) => {
+    if (p.kind === "letterhead") {
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({ text: p.text, bold: i === 0, size: i === 0 ? 24 : 18 })],
+        }),
+      );
+    } else if (p.kind === "title") {
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 160 },
+          children: [new TextRun({ text: p.text.toUpperCase(), bold: true, size: 26 })],
+        }),
+      );
+    } else {
+      children.push(new Paragraph({ children: [new TextRun({ text: p.text, size: 20 })] }));
+    }
+  });
+  if (masthead.length) {
+    children.push(new Paragraph({ spacing: { before: 200, after: 120 }, children: [] }));
+  }
 
   children.push(
     new Paragraph({
@@ -408,32 +672,115 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
   return Packer.toBuffer(doc);
 }
 
+/**
+ * The clean translation as DOCX: source masthead, translated body styled with
+ * real heading levels, certification notice at the foot.
+ */
+export async function buildTranslationDocx(input: ExportInput): Promise<Buffer> {
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } =
+    (await import("docx")) as typeof import("docx");
+
+  ensureDirs();
+
+  const children: Array<InstanceType<typeof Paragraph>> = [];
+
+  const masthead = partsOf(input, "target");
+  masthead.forEach((p, i) => {
+    if (p.kind === "letterhead") {
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({ text: p.text, bold: i === 0, size: i === 0 ? 24 : 18 })],
+        }),
+      );
+    } else if (p.kind === "title") {
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 160 },
+          heading: HeadingLevel.HEADING_1,
+          children: [new TextRun({ text: p.text.toUpperCase(), bold: true })],
+        }),
+      );
+    } else {
+      children.push(new Paragraph({ children: [new TextRun({ text: p.text, size: 20 })] }));
+    }
+  });
+  if (masthead.length) children.push(new Paragraph({ spacing: { before: 160 }, children: [] }));
+
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new TextRun({ text: DRAFT_NOTICE, italics: true, color: "991B1B", size: 17 })],
+    }),
+    new Paragraph({ children: [] }),
+  );
+
+  for (const b of bodyOf(input)) {
+    const text = englishOf(b);
+    if (!text.trim()) continue;
+    const role = roleOf(b);
+    if (role === "h1") {
+      children.push(new Paragraph({ text, heading: HeadingLevel.HEADING_1, spacing: { before: 240 } }));
+    } else if (role === "h2") {
+      children.push(new Paragraph({ text, heading: HeadingLevel.HEADING_2, spacing: { before: 180 } }));
+    } else {
+      children.push(new Paragraph({ spacing: { after: 120 }, children: [new TextRun({ text })] }));
+    }
+  }
+
+  const ind = input.report.fidelityIndicator;
+  const band = ind.grade === "green" ? "166534" : ind.grade === "yellow" ? "92400E" : "991B1B";
+  children.push(
+    new Paragraph({
+      spacing: { before: 360 },
+      children: [new TextRun({ text: `Automated quality indicator: ${indicatorLine(input.report)} — NOT CERTIFIED`, bold: true, color: band })],
+    }),
+    new Paragraph({ children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
+    new Paragraph({
+      children: [new TextRun({ text: `Source SHA-256: ${input.report.sourceSha256}   ·   Generated: ${input.report.generatedAt}`, size: 15, color: "555555" })],
+    }),
+  );
+
+  const doc = new Document({ sections: [{ properties: {}, children }] });
+  return Packer.toBuffer(doc);
+}
+
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 
 export type ExportFormat = "pdf" | "docx" | "txt";
 
+const SUFFIX: Record<ExportKind, string> = {
+  verification: "verification-report",
+  translation: "english-translation",
+};
+
 export async function exportDocument(
   input: ExportInput,
   format: ExportFormat,
+  kind: ExportKind = "verification",
 ): Promise<{ path: string; bytes: number }> {
   ensureDirs();
   const base = safeName(input.docId);
 
+  const suffix = SUFFIX[kind];
+  const wantsTranslation = kind === "translation";
+
   if (format === "txt") {
-    const p = path.join(config.exportDir, `${base}-verification-report.txt`);
-    fs.writeFileSync(p, buildTextExport(input), "utf8");
+    const p = path.join(config.exportDir, `${base}-${suffix}.txt`);
+    fs.writeFileSync(p, wantsTranslation ? buildTranslationText(input) : buildTextExport(input), "utf8");
     return { path: p, bytes: fs.statSync(p).size };
   }
 
   if (format === "pdf") {
-    const buf = await buildPdfExport(input);
-    const p = path.join(config.exportDir, `${base}-verification-report.pdf`);
+    const buf = wantsTranslation ? await buildTranslationPdf(input) : await buildPdfExport(input);
+    const p = path.join(config.exportDir, `${base}-${suffix}.pdf`);
     fs.writeFileSync(p, buf);
     return { path: p, bytes: buf.length };
   }
 
-  const buf = await buildDocxExport(input);
-  const p = path.join(config.exportDir, `${base}-verification-report.docx`);
+  const buf = wantsTranslation ? await buildTranslationDocx(input) : await buildDocxExport(input);
+  const p = path.join(config.exportDir, `${base}-${suffix}.docx`);
   fs.writeFileSync(p, buf);
   return { path: p, bytes: buf.length };
 }
