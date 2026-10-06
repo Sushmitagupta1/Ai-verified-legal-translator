@@ -12,7 +12,9 @@ import { LlmError, type LlmClient, type LlmMessage, type LlmOptions } from "./pr
  */
 export function createOllama(): LlmClient {
   const baseUrl = (config.llm.baseUrl || "http://127.0.0.1:11434/v1").replace(/\/$/, "");
-  const model = config.llm.model || "qwen2.5:14b-instruct";
+  // `qwen2.5:14b` is the canonical Ollama tag; `qwen2.5:14b-instruct` does not
+  // exist and returns 404 from the local server.
+  const model = config.llm.model || "qwen2.5:14b";
 
   return {
     name: "ollama",

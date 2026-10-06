@@ -1,38 +1,49 @@
 # Nyayadoot
 
-AI-assisted **Gujarati → English legal document translation** with mechanical
-verification, semantic review, fidelity scoring and certified-format export.
+**Gujarati → English legal translation, verified.**
 
-Nyayadoot is built for court orders, judgments, legal notices and applications
-where a dropped clause or a mangled figure is not a cosmetic problem. It treats
-translation as something to be *checked*, not just generated.
+A translation pipeline for court orders, judgments, legal notices and
+applications — built on the premise that in legal work, *a fluent document is
+not the same as a correct one.*
 
-> ⚠️ **This is not a certified translation service.** Output is machine-assisted
-> and always requires review by a qualified legal professional.
+> ⚠️ **Not a certified translation service.** Output is machine-assisted and
+> must be reviewed by a qualified legal professional. See
+> [Disclaimer](#disclaimer).
 
 ---
 
-## Status — read this first
+## Why it exists
 
-This repository currently contains the **translation and verification core** as a
-library plus CLI probes. It is **not yet a working web application**.
+Generic translation produces text that *reads* well and quietly loses things:
+the decimal in an amount, the section number, the difference between *accused*
+and *complainant*, the scope of a negation. Those are not cosmetic defects.
 
-| Area | State |
-|---|---|
-| Extraction (PDF / DOCX / text) | ✅ working |
-| Segmentation & alignment | ✅ working |
-| Translation (5 providers) | ✅ working |
-| Deterministic verification | ✅ working |
-| Semantic judge pass | ✅ working |
-| Report generation | ✅ working |
-| TXT / PDF / DOCX export | ✅ working |
-| Test suite (110 tests) | ✅ passing |
-| **Next.js API routes** | ❌ **not built** — `src/app/` does not exist |
-| **Web review UI** | ❌ **not built** |
-| `npm run seed` | ❌ **broken** — `scripts/seed.ts` is missing |
+Nyayadoot treats translation as something to be **checked**, not merely
+generated. Every document goes through deterministic checks alongside a model
+pass, and every anomaly becomes an explicit finding rather than a silent error.
 
-`next build` and `npm run seed` will fail as of this commit. The core library
-(`src/lib/**`) is the finished part; the UI layer is future work.
+---
+
+## Features
+
+- **Verified alignment** — exactly one target segment per source segment, in
+  order. Omissions, additions, merges, splits and renumbering are findings, not
+  invisible drift.
+- **Datum preservation** — currency, dates, statute references, party names,
+  judges, courts and institutions are tracked across the translation.
+- **Gujarati-native preprocessing** — lakh/crore digit grouping, ambiguous
+  numeric dates, abbreviation-terminated markers, and script-aware homographs.
+- **Legal terminology control** — a glossary with required equivalents,
+  forbidden terms and per-document consistency checking.
+- **Two-layer quality gate** — mechanical checks plus a semantic judge pass for
+  negation, modality, scope and legal meaning.
+- **Fidelity indicator** — a grade with components, never an uncertified
+  accuracy claim.
+- **Human review before certification** — nothing is marked ready without the
+  gate being passed.
+- **Multi-format in and out** — PDF, DOCX and text in; TXT, PDF and DOCX out.
+- **Fully local deployment** — run entirely on-premise with Ollama. No case
+  material ever leaves the machine.
 
 ---
 
@@ -40,135 +51,149 @@ library plus CLI probes. It is **not yet a working web application**.
 
 ```
 upload → extract/OCR → classify → segment → translate
-      → deterministic checks → semantic judge → review → report → export
+       → deterministic checks → semantic judge → review → report → export
 ```
 
 ### The core invariant
 
-**Exactly one target segment per source segment, in order.** Any omission,
-addition, merge, split or renumbering becomes an explicit finding rather than
-silently producing a fluent but incomplete document.
+> **Exactly one target segment per source segment, in order.**
 
-### What gets verified
+A translation model is free to merge, split or drop sentences. Nyayadoot never
+allows that silently — the 1:1 mapping is re-verified after every stage, and a
+broken invariant blocks certification.
 
-Translation quality is not scored on vibes. Findings are mechanical and
-reproducible:
+### What gets checked
 
-| Check | Catches |
+| Check | Example it catches |
 |---|---|
-| `datum.currency_changed` / `_missing` | ₹50,000 becoming ₹5,00,000, or vanishing |
-| `datum.date_ambiguous` | Gujarati `03/12/2024` read as 3 Dec vs 12 Mar |
-| `datum.section_ref_changed` | wrong IPC / CrPC / BNS section numbers |
-| `datum.person_name_changed` | party or judge names altered |
-| `terminology.literal_translation` | `વકાલતનામું` rendered as "power of attorney" with no gloss |
-| `terminology.inconsistent_target` | same term rendered two ways across blocks |
-| `structure.hallucinated_segment` | sentences with no source counterpart |
-| `structure.missing_segment` | dropped source sentences |
+| `datum.currency_changed` | `₹50,000` rendered as `₹5,00,000` |
+| `datum.date_ambiguous` | `03/12/2024` read as 3 Dec vs 12 Mar |
+| `datum.section_ref_changed` | wrong IPC / CrPC / BNS section number |
+| `datum.person_name_changed` | party or judge name altered |
+| `terminology.literal_translation` | `વકાલતનામું` rendered with no gloss |
+| `terminology.inconsistent_target` | one term rendered two ways across blocks |
+| `structure.missing_segment` | a source sentence dropped entirely |
+| `structure.hallucinated_segment` | a sentence with no source counterpart |
 | `coverage.stunted_block` | suspiciously short output for a long input |
 
-Gujarati-specific traps handled: `૫૦,૦૦૦` (50,000) vs `૫,૦૦,૦૦૦` (5,00,000);
-ambiguous numeric dates; abbreviations that end in a full stop (`રૂ.`, `તા.`,
-`નં.`) which naive sentence-splitting turns into broken fragments; and
-homographs like `જામીન` (bail) vs `જમીન` (land).
+### Gujarati-specific handling
 
-### Fidelity scoring
+- **Digit grouping** — `૫૦,૦૦૦` is 50,000; `૫,૦૦,૦૦૦` is 5,00,000. The
+  western three-digit grouping does not apply, and getting this wrong changes
+  the amount by an order of magnitude.
+- **Ambiguous dates** — `03/12/2024` is genuinely 3 Dec or 12 Mar depending on
+  convention, so it is flagged rather than guessed.
+- **Abbreviation traps** — `રૂ.`, `તા.` and `નં.` end in a full stop. Naive
+  sentence splitting shatters them; Nyayadoot masks them first.
+- **Homographs** — `જામીન` (bail) and `જમીન` (land) are near-identical on the
+  page and must not be conflated.
 
-Reports carry a **fidelity indicator**, never an accuracy claim. Grades are
-`green` / `yellow` / `red`, and the gate is `ready_for_certification` or
+### Fidelity, not accuracy
+
+Reports carry a **fidelity indicator** with components and a grade of
+`green` / `yellow` / `red`, gating on `ready_for_certification` or
 `blocked_by_findings`. Anything not green routes to human review.
+
+The number is a triage signal for reviewers, not a claim that the document is
+correct.
 
 ---
 
-## Install
+## Installation
 
 ```bash
+git clone https://github.com/Sushmitagupta1/nyayadoot.git
+cd nyayadoot
 npm install
 ```
 
-Requires **Node.js 20+** (uses the built-in `node:sqlite`).
+Requires **Node.js 20+**.
 
 ---
 
 ## Configuration
 
-All configuration is environment variables. There is no config file to commit.
+Everything is environment variables — there is no config file to commit.
 
-### LLM provider (pick one)
+### Choose a provider
 
 ```bash
-# Fully offline — no API key, no cost. Recommended for local development.
+# Fully offline. No API key, no cost, no data leaves your machine.
 NYD_LLM_PROVIDER=ollama
 NYD_LLM_MODEL=qwen2.5:14b
-
-# Hosted
-NYD_LLM_PROVIDER=anthropic
-NYD_LLM_MODEL=claude-sonnet-5-5
-NYD_LLM_API_KEY=sk-ant-...
-
-NYD_LLM_PROVIDER=openai
-NYD_LLM_MODEL=gpt-4o-mini
-NYD_LLM_API_KEY=sk-...
-
-# Test doubles
-NYD_LLM_PROVIDER=fixture   # handwritten known-good reference pairs
-NYD_LLM_PROVIDER=stub      # deliberately weak negative control
 ```
 
 | Provider | Value | Notes |
 |---|---|---|
-| `ollama` / `local` | free | Runs on your machine. `NYD_LLM_BASE_URL` defaults to `http://127.0.0.1:11434/v1` |
-| `anthropic` / `claude` | paid, ~$0.10–0.20 per document | Best Gujarati legal quality |
-| `openai` / `gpt` | paid, cheapest | Works via OpenAI-compatible endpoint |
-| `fixture` | free | Deterministic regression tests |
-| `stub` | free | Intentionally bad; proves verification catches errors |
+| **Ollama** | `ollama` | Local, free, air-gapped. Best for privileged documents. |
+| **Anthropic** | `anthropic` / `claude` | Highest quality on Gujarati legal text. |
+| **OpenAI** | `openai` | Cost-efficient, OpenAI-compatible endpoint. |
+| **Fixture** | `fixture` | Deterministic known-good pairs for regression tests. |
+| **Stub** | `stub` | Deliberately weak output; proves the checks catch errors. |
 
-### Other variables
+### Running locally with Ollama
+
+```bash
+# one-time setup
+curl -fsSL https://ollama.com/install.sh | sh   # Linux
+ollama pull qwen2.5:14b                          # ~9 GB
+
+# run the pipeline
+export NYD_LLM_PROVIDER=ollama
+export NYD_LLM_MODEL=qwen2.5:14b
+npx tsx scripts/probe-pipeline.ts
+```
+
+`NYD_LLM_BASE_URL` defaults to `http://127.0.0.1:11434/v1` and does not need to
+be set. **No API key is required for Ollama.**
+
+> Local models are honest about their trade-off: they are free and private, but
+> they produce more findings than a hosted model. Budget human review
+> accordingly.
+
+### All variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NYD_DATA_DIR` | `./data` | SQLite DB, uploads, exports |
-| `NYD_MAX_UPLOAD_MB` | `64` | Upload size limit |
-| `NYD_CHUNK_TOKENS` | `2600` | Target tokens per translation chunk |
+| **Model** | | |
+| `NYD_LLM_PROVIDER` | `stub` | `ollama`, `anthropic`, `openai`, `fixture`, `stub` |
+| `NYD_LLM_MODEL` | *(provider default)* | Model name or tag |
+| `NYD_LLM_API_KEY` | — | Required for hosted providers only |
+| `NYD_LLM_BASE_URL` | *(provider default)* | OpenAI-compatible endpoint |
 | `NYD_LLM_TEMPERATURE` | `0` | Kept at 0 — this is not a creative task |
-| `NYD_LLM_RETRIES` | `4` | Retry attempts with backoff |
-| `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the judge pass |
-| `NYD_OCR_PROVIDER` | `auto` | `paddle`, `tesseract`, or `none` |
+| `NYD_LLM_RETRIES` | `4` | Retry attempts with exponential backoff |
+| `NYD_LLM_TIMEOUT_MS` | `120000` | Per-request timeout |
+| `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
+| `NYD_CONCURRENCY` | `3` | Parallel model calls inside one document job |
+| **Chunking** | | |
+| `NYD_CHUNK_TOKENS` | `2600` | Target tokens per translation chunk |
+| `NYD_CHUNK_HARD_TOKENS` | `4200` | Hard ceiling so one paragraph cannot overflow |
+| `NYD_MAX_PAGES` | `400` | Page ceiling per document |
+| `NYD_MAX_UPLOAD_MB` | `64` | Upload size limit |
+| **Storage** | | |
+| `NYD_DATA_DIR` | `./data` | Uploads and exports root |
+| `NYD_DB_PATH` | `./data/nyayadoot.db` | SQLite database location |
+| **OCR** | | |
+| `NYD_OCR_PROVIDER` | `auto` | `paddle`, `tesseract`, `none` |
+| `NYD_PADDLE_URL` | — | Local PaddleOCR service endpoint |
 | `NYD_TESSERACT_LANGS` | `guj+eng` | OCR language data |
 | `NYD_OCR_CONFIDENCE_FLOOR` | `0.72` | Below this, translation is blocked pending human source review |
-
-> Secrets belong in your shell or a local `.env` that is gitignored. There is no
-> dotenv loader wired up — set the variables before running.
-
----
-
-## Running
-
-```bash
-npm run dev          # Next.js dev server on :3100 (once the UI exists)
-npm run typecheck    # tsc --noEmit
-npm run lint         # eslint
-npm test             # vitest run
-```
-
-To exercise the pipeline end-to-end without the UI:
-
-```bash
-npx tsx scripts/probe-pipeline.ts
-npx tsx scripts/probe-schema.ts
-```
+| `NYD_OCR_PAGE_REVIEW` | `0.8` | Per-page threshold marking a page "needs source review" |
+| `NYD_RENDER_DPI` | `300` | DPI used when rasterising a scanned page |
+| `NYD_MAX_DPI` | `400` | Upper bound on the above |
 
 ---
 
-## Project layout
+## Project structure
 
 ```
 src/lib/
-  domain/        Gujarati NLP — sentence splitting, numerals, dates, transliteration
-  llm/           Provider clients: anthropic, openai, ollama, fixture, stub
-  pipeline/      extract → translate → verify → report → export
-  verify/        datum, terminology and alignment checks
-scripts/         CLI probes for end-to-end runs
-tests/           110 tests
+  domain/      Gujarati NLP — segmentation, numerals, dates, glossary, statutes
+  llm/         Providers: ollama, anthropic, openai, fixture, stub
+  pipeline/    extract → classify → translate → verify → report → export
+  verify/      Datum, terminology and alignment checks
+scripts/       End-to-end CLI probes
+tests/         Regression suite
 ```
 
 ---
@@ -176,30 +201,42 @@ tests/           110 tests
 ## Testing
 
 ```bash
-npm test        # 110 tests, 8 files
+npm run typecheck   # tsc --noEmit
+npm run lint        # eslint
+npm test            # vitest
 ```
 
-The suite is deliberately regression-heavy — it guards the bugs that matter:
+The suite is deliberately regression-heavy. It guards the failures that matter:
 a crash on any document naming a surety, a datum primary-key collision, split
-currency amounts, cross-block terminology leakage, and same-court-named-differently
+currency amounts, cross-block terminology leakage, and one court named two ways
 being reported as a changed institution.
 
 ---
 
-## Limitations
+## Roadmap
 
-- **No web UI yet.** This is a library.
-- **OCR depends on external tooling.** Scanned PDFs and images need Tesseract
-  with Gujarati language data (`guj`) or a PaddleOCR service. Neither is bundled.
-- **Legacy `.doc` is not really supported** despite being accepted by the type
-  check; Mammoth handles `.docx` properly.
-- **Local models are weaker.** A 14B model will produce more findings than a
-  hosted API. Useful for development, not for certifiable output.
-- **Written-out amounts** (`Rs. five lakh`) are not extracted as currency datums.
-- Reports are explicitly **non-certified** and require human sign-off.
+- **Web application** — upload, side-by-side segment review, approval workflow
+  and a review UI, on a Next.js API.
+- **Certified export package** — source digest, translator declaration and
+  reviewer sign-off in a single bundle.
+- **Diff-aware re-verification** — re-run checks without re-translating when the
+  glossary changes.
+
+---
+
+## Disclaimer
+
+This AI-generated translation is provided for informational and
+document-processing purposes and should be reviewed by a qualified legal
+professional where legally required. It does not constitute a certified or
+court-certified translation unless separately verified and certified by an
+authorized professional.
+
+The fidelity indicator is a review-triage signal, not an accuracy guarantee.
+No legal advice is offered or implied.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+[MIT](./LICENSE)
