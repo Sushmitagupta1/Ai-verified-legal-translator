@@ -212,29 +212,7 @@ async function extractDocx(buffer: Buffer, warnings: string[]): Promise<ExtractR
     );
   }
 
-  const blocks: string[] = [];
-  const pageBreakIdx: number[] = [];
-  const tokens = result.value.split(/(<\/?(?:p|h[1-6]|tr|table|br)\b[^>]*>)/gi);
-
-  for (const t of tokens) {
-    if (/^<br\s*\/?>$/i.test(t)) continue;
-    const isBreak = /^<p[^>]*page-break-before:\s*always/i.test(t) || /pagebreakbefore/i.test(t);
-    if (isBreak) {
-      pageBreakIdx.push(blocks.length);
-      continue;
-    }
-    if (/^<\//.test(t) || /^<[a-z]/i.test(t)) continue;
-    const text = normalizeWhitespace(
-      t
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"'),
-    );
-    if (text) blocks.push(text);
-  }
+  const blocks = paragraphsFromHtml(result.value);
 
   const joined = blocks.join("\n\n");
   const approxPages = Math.max(1, Math.ceil(joined.length / 1800));
@@ -260,6 +238,48 @@ async function extractDocx(buffer: Buffer, warnings: string[]): Promise<ExtractR
     meanOcrConfidence: null,
     warnings,
   };
+}
+
+/**
+ * Turn mammoth's HTML into one string per paragraph.
+ *
+ * The split isolates every block-level tag as its own token; anything left in a
+ * text token — an inline `<strong>`, a whole `<ol>` — is markup to strip, never
+ * a reason to discard the paragraph. That distinction matters: bold text is
+ * exactly where a letterhead name and a report title live, so skipping text
+ * that begins with a tag silently deletes the two lines the report pattern is
+ * recognised from.
+ *
+ * Lists are split per item so each `<li>` becomes its own paragraph instead of
+ * a run-on line of everything the list contained.
+ */
+export function paragraphsFromHtml(html: string): string[] {
+  const blocks: string[] = [];
+  const tokens = html.split(/(<\/?(?:p|h[1-6]|tr|table|br|li|ol|ul)\b[^>]*>)/gi);
+
+  for (const t of tokens) {
+    if (/^<br\s*\/?>$/i.test(t)) continue;
+    // An explicit page break is a boundary, not content.
+    if (/^<[^>]*page-break-before\s*:\s*always/i.test(t) || /^<[^>]*pagebreakbefore/i.test(t)) {
+      continue;
+    }
+    const text = normalizeWhitespace(
+      t
+        // Cell boundaries need a separator; every other tag is pure structure
+        // and must not inject a space, or `<strong>Name</strong>:` renders as
+        // "Name :".
+        .replace(/<\/(?:td|th)\s*>/gi, " ")
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"'),
+    );
+    if (text) blocks.push(text);
+  }
+
+  return blocks;
 }
 
 // ── Structure detection ───────────────────────────────────────────────────────
