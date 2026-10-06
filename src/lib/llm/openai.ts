@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { backoff, sleep } from "./anthropic";
-import { LlmError, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
+import { LlmError, requestSignal, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
 
 /**
  * OpenAI-compatible chat-completions client.
@@ -52,7 +52,7 @@ export function createOpenAi(): LlmClient {
               authorization: `Bearer ${apiKey}`,
             },
             body: JSON.stringify(body),
-            signal: opts.signal,
+            signal: requestSignal(opts.signal),
           });
 
           if (!res.ok) {

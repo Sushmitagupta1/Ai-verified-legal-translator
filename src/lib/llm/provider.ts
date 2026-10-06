@@ -109,6 +109,21 @@ export interface LlmClient {
   readonly available: boolean;
 }
 
+/**
+ * Fetch signal for a single request: the caller's cancellation plus a hard timeout.
+ *
+ * Without a timeout one unanswered request stalls the whole pipeline at whatever
+ * stage it reached — the job sits on "Generating report" forever with no error
+ * to surface. `AbortSignal.any` keeps the caller's abort working alongside it.
+ */
+export function requestSignal(
+  base?: AbortSignal,
+  timeoutMs: number = config.llm.timeoutMs,
+): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return base ? AbortSignal.any([base, timeout]) : timeout;
+}
+
 export class LlmError extends Error {
   constructor(
     message: string,

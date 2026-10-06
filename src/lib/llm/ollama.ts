@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { backoff, sleep } from "./anthropic";
-import { LlmError, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
+import { LlmError, requestSignal, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
 
 /**
  * Ollama / local OpenAI-compatible server.
@@ -46,7 +46,7 @@ export function createOllama(): LlmClient {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(body),
-            signal: opts.signal,
+            signal: requestSignal(opts.signal),
           });
 
           if (!res.ok) {

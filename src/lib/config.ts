@@ -53,7 +53,7 @@ export const config = {
     baseUrl: process.env.NYD_LLM_BASE_URL ?? "",
     temperature: Number(process.env.NYD_LLM_TEMPERATURE ?? 0),
     maxRetries: envInt("NYD_LLM_RETRIES", 4),
-    timeoutMs: envInt("NYD_LLM_TIMEOUT_MS", 120_000),
+    timeoutMs: envInt("NYD_LLM_TIMEOUT_MS", 300_000),
     /** Judge pass runs at a different (usually stronger) model when configured. */
     judgeModel: process.env.NYD_JUDGE_MODEL ?? "",
   },

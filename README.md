@@ -162,7 +162,7 @@ be set. **No API key is required for Ollama.**
 | `NYD_LLM_BASE_URL` | *(provider default)* | OpenAI-compatible endpoint |
 | `NYD_LLM_TEMPERATURE` | `0` | Kept at 0 — this is not a creative task |
 | `NYD_LLM_RETRIES` | `4` | Retry attempts with exponential backoff |
-| `NYD_LLM_TIMEOUT_MS` | `120000` | Per-request timeout |
+| `NYD_LLM_TIMEOUT_MS` | `300000` | Per-request timeout; must outlast one translation chunk on a local model |
 | `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
 | `NYD_CONCURRENCY` | `3` | Parallel model calls inside one document job |
 | **Chunking** | | |

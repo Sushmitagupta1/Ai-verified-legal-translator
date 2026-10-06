@@ -2,8 +2,8 @@
 import path from "node:path";
 import { config, ensureDirs } from "../config";
 import { buildReportPrompt, REPORT_SYSTEM } from "../llm/prompts";
-import { parseJson } from "../llm/provider";
-import type { LlmClient } from "../llm/provider";
+import { parseJsonLoose } from "../llm/provider";
+import type { LlmClient, LlmMessage } from "../llm/provider";
 import type { VerificationResult } from "./verify";
 
 export interface ReportNarrative {
@@ -224,6 +224,14 @@ function severityRank(s: string): number {
   return s === "critical" ? 3 : s === "major" ? 2 : s === "minor" ? 1 : 0;
 }
 
+/** Shape the model is asked for; every field optional because it may be omitted. */
+interface NarrativeFields {
+  executiveSummary?: string;
+  reviewFocus?: string[];
+  limitations?: string[];
+  recommendedAction?: string;
+}
+
 /** Prompt the model for the narrative sections only. Counts come from the data. */
 export async function generateNarrative(
   llm: LlmClient,
@@ -269,57 +277,72 @@ export async function generateNarrative(
     };
   }
 
-  try {
-    const raw = await llm.complete(
-      [
-        { role: "system", content: REPORT_SYSTEM },
-        {
-          role: "user",
-          content: buildReportPrompt({
-            meta:
-              `File: ${input.fileName}\nDocument type: ${input.docTypeLabel} (${input.docType})\nPages: ${input.pageCount}\n` +
-              `Translation provider: ${input.providerLabel}\nSource SHA-256: ${input.sourceSha256}\nTranslated: ${input.translatedAt}`,
-            deterministic:
-              counts.datumCount > 0
-                ? `${counts.datumCount} data item(s) extracted from both sides and compared by value.\n` +
-                  `Discrepancies: ${v.datums.filter((d) => d.status === "changed").length} changed, ` +
-                  `${v.datums.filter((d) => d.status === "missing").length} missing, ` +
-                  `${v.datums.filter((d) => d.status === "added").length} added.`
-                : "No fact-shaped data (numbers, amounts, dates, references, names) were found in this document, so the data-fidelity check had nothing to compare.",
-            judgeFindings:
-              v.findings.length > 0
-                ? v.findings
-                    .slice(0, 80)
-                    .map((f) => `- [${f.severity}] ${f.category} / ${f.check}${f.pageNumber ? ` (page ${f.pageNumber})` : ""}: ${f.title}. ${f.detail}`)
-                    .join("\n")
-                : "No findings were raised by the automated checks.",
-            metrics:
-              `Blocks: ${counts.blocks}\nTranslation segments: ${counts.segments}\n` +
-              `Block coverage: ${(v.coverage.ratio * 100).toFixed(1)}%\n` +
-              `Findings: ${counts.findings} (critical ${counts.critical}, major ${counts.major}, minor ${counts.minor})\n` +
-              `Semantic review: ${v.judge.available ? "ran" : "did not run"}\n` +
-              `Source OCR confidence: ${input.verification.warnings.some((w) => w.includes("OCR")) ? "see warnings" : "embedded text layer or high confidence"}`,
-          }),
-        },
-      ],
-      { json: true, maxOutputTokens: 3_000 },
-    );
+  const messages: LlmMessage[] = [
+    { role: "system", content: REPORT_SYSTEM },
+    {
+      role: "user",
+      content: buildReportPrompt({
+        meta:
+          `File: ${input.fileName}\nDocument type: ${input.docTypeLabel} (${input.docType})\nPages: ${input.pageCount}\n` +
+          `Translation provider: ${input.providerLabel}\nSource SHA-256: ${input.sourceSha256}\nTranslated: ${input.translatedAt}`,
+        deterministic:
+          counts.datumCount > 0
+            ? `${counts.datumCount} data item(s) extracted from both sides and compared by value.\n` +
+              `Discrepancies: ${v.datums.filter((d) => d.status === "changed").length} changed, ` +
+              `${v.datums.filter((d) => d.status === "missing").length} missing, ` +
+              `${v.datums.filter((d) => d.status === "added").length} added.`
+            : "No fact-shaped data (numbers, amounts, dates, references, names) were found in this document, so the data-fidelity check had nothing to compare.",
+        judgeFindings:
+          v.findings.length > 0
+            ? v.findings
+                .slice(0, 80)
+                .map((f) => `- [${f.severity}] ${f.category} / ${f.check}${f.pageNumber ? ` (page ${f.pageNumber})` : ""}: ${f.title}. ${f.detail}`)
+                .join("\n")
+            : "No findings were raised by the automated checks.",
+        metrics:
+          `Blocks: ${counts.blocks}\nTranslation segments: ${counts.segments}\n` +
+          `Block coverage: ${(v.coverage.ratio * 100).toFixed(1)}%\n` +
+          `Findings: ${counts.findings} (critical ${counts.critical}, major ${counts.major}, minor ${counts.minor})\n` +
+          `Semantic review: ${v.judge.available ? "ran" : "did not run"}\n` +
+          `Source OCR confidence: ${input.verification.warnings.some((w) => w.includes("OCR")) ? "see warnings" : "embedded text layer or high confidence"}`,
+      }),
+    },
+  ];
 
-    const parsed = parseJson<{
-      executiveSummary?: string;
-      reviewFocus?: string[];
-      limitations?: string[];
-      recommendedAction?: string;
-    }>(raw);
+  try {
+    // JSON mode is a hint, not a guarantee: a local model will still answer in
+    // prose, invent field names, or be cut off mid-object. One more attempt
+    // costs a few minutes but keeps a real narrative in the report; after that
+    // the fallback below carries the run instead of failing it.
+    let parsed: NarrativeFields | null = null;
+    for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+      const raw = await llm.complete(messages, {
+        json: true,
+        // A truncated object cannot be parsed at all, so leave headroom for a
+        // four-section narrative plus a long critical-findings list.
+        maxOutputTokens: 4_096,
+      });
+      parsed = parseJsonLoose<NarrativeFields>(raw);
+    }
+
+    if (!parsed) {
+      // An unusable response still yields a usable (if blunt) narrative rather
+      // than aborting the run: the report must always exist so a human can review.
+      return {
+        executiveSummary: "Narrative generation returned no usable summary.",
+        reviewFocus: ["The findings table below, in severity order."],
+        limitations: ["The model's narrative summary could not be read as JSON."],
+        recommendedAction: "Review the automated findings manually before relying on this translation.",
+        modelGenerated: false,
+      };
+    }
 
     return {
-      // An unparseable response still yields a usable (if blunt) narrative rather
-      // than aborting the run: the report must always exist so a human can review.
       executiveSummary: parsed.executiveSummary ?? "Narrative generation returned no usable summary.",
       reviewFocus: parsed.reviewFocus ?? [],
       limitations: parsed.limitations ?? [],
       recommendedAction: parsed.recommendedAction ?? "Review the automated findings manually before relying on this translation.",
-      modelGenerated: true,
+      modelGenerated: Boolean(parsed.executiveSummary),
     };
   } catch (err) {
     return {

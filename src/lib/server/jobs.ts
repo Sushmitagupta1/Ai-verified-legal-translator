@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { config, ensureDirs } from "@/lib/config";
-import { get, run, type SqlValue } from "@/lib/db";
+import { all, get, run, type SqlValue } from "@/lib/db";
 import { createLlmClient } from "@/lib/llm";
 import { runPipeline, type Stage } from "@/lib/pipeline/run";
 
@@ -45,7 +45,53 @@ interface DocumentRow {
   declared_type: string | null;
 }
 
-const live = new Map<string, JobState>();
+/**
+ * Next serves each route from its own module instance, so a plain module-level
+ * map would be per-route. Hoisting it onto `globalThis` keeps one view of what
+ * is actually running for the whole process.
+ */
+type JobsGlobals = { __nydLiveJobs?: Map<string, JobState> };
+const globals = globalThis as typeof globalThis & JobsGlobals;
+const live: Map<string, JobState> = (globals.__nydLiveJobs ??= new Map());
+
+/**
+ * When this process booted, so a sweep can tell "left behind by a process that
+ * died" from "started by this one".
+ *
+ * Age is the only safe test: a route bundle evaluates this file once per
+ * instance, so any "have I swept yet?" flag can fire again while a run started
+ * elsewhere is still in flight — and fail the job row out from under it.
+ */
+const PROCESS_STARTED_AT = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
+sweepOrphanedJobs();
+
+/**
+ * A process killed mid-run leaves its job row `running` with nothing to finish
+ * it, and the UI would show a progress bar that never moves. Fail those, and
+ * leave anything this process could still be working on alone.
+ */
+function sweepOrphanedJobs(): void {
+  const orphans = all<{ id: string; document_id: string }>(
+    `SELECT id, document_id FROM jobs
+      WHERE status IN ('queued', 'running')
+        AND created_at < ?`,
+    PROCESS_STARTED_AT,
+  ).filter((row) => !live.has(row.document_id));
+
+  for (const orphan of orphans) {
+    const now = new Date().toISOString();
+    const message = "Interrupted — the server stopped before this run finished. Run it again.";
+    run(`UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`, message, now, orphan.id);
+    run(
+      `UPDATE documents SET status = 'failed', stage = 'failed', error = ?, updated_at = ?
+        WHERE id = ? AND status = 'running'`,
+      message,
+      now,
+      orphan.document_id,
+    );
+  }
+}
 
 export function getJobState(documentId: string): JobState | null {
   const current = live.get(documentId);
@@ -116,7 +162,16 @@ function readProgress(payload: string | null | undefined): Progress {
 
 export function isRunning(documentId: string): boolean {
   const state = live.get(documentId);
-  return state?.status === "queued" || state?.status === "running";
+  if (state?.status === "queued" || state?.status === "running") return true;
+
+  // The map is per module instance, so a run started by another route bundle is
+  // only visible in the jobs table. Orphans are swept at startup, which is what
+  // makes an open row here a live run rather than a leftover.
+  const row = get<{ status: string }>(
+    `SELECT status FROM jobs WHERE document_id = ? ORDER BY created_at DESC LIMIT 1`,
+    documentId,
+  );
+  return row?.status === "queued" || row?.status === "running";
 }
 
 export function startJob(documentId: string): JobState {

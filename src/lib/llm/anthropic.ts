@@ -1,5 +1,5 @@
 import { config } from "../config";
-import { LlmError, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
+import { LlmError, requestSignal, type LlmClient, type LlmMessage, type LlmOptions } from "./provider";
 
 interface AnthropicUsage {
   input_tokens?: number;
@@ -59,7 +59,7 @@ export function createAnthropic(): LlmClient {
               system: system || undefined,
               messages: convo,
             }),
-            signal: opts.signal,
+            signal: requestSignal(opts.signal),
           });
 
           if (!res.ok) {
