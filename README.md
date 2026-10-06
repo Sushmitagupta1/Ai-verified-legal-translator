@@ -184,13 +184,43 @@ be set. **No API key is required for Ollama.**
 
 ---
 
+## Web application
+
+The same pipeline behind a browser interface: upload a document, watch it run,
+review every segment and finding, and download the verification report.
+
+```bash
+export NYD_LLM_PROVIDER=ollama
+export NYD_LLM_MODEL=qwen2.5:14b
+npm run dev        # http://localhost:3100
+```
+
+| Route | Purpose |
+|---|---|
+| `POST /api/documents` | Upload — multipart `file`, optional `type` to override detection |
+| `GET /api/documents` | List documents |
+| `GET /api/documents/:id` | Document, job progress, report, segments and findings |
+| `POST /api/documents/:id/run` | Start or restart the pipeline |
+| `GET /api/documents/:id/export/:fmt` | Download the report as `txt`, `pdf` or `docx` |
+| `GET /api/health` | Provider, model and OCR backend status |
+
+Jobs run outside the request: `POST .../run` returns `202` immediately, progress
+is written to the `jobs` table, and the review page polls until the pipeline
+finishes. A four-page document takes roughly ten minutes on a local 14B model.
+A run produces one ordered target segment per source segment, so the segment
+list on the review page is the alignment, not a summary of it.
+
+---
+
 ## Project structure
 
 ```
+src/app/       Next.js App Router — pages and API routes
 src/lib/
   domain/      Gujarati NLP — segmentation, numerals, dates, glossary, statutes
   llm/         Providers: ollama, anthropic, openai, fixture, stub
   pipeline/    extract → classify → translate → verify → report → export
+  server/      Long-running job runner for the web app
   verify/      Datum, terminology and alignment checks
 scripts/       End-to-end CLI probes
 tests/         Regression suite
@@ -215,8 +245,8 @@ being reported as a changed institution.
 
 ## Roadmap
 
-- **Web application** — upload, side-by-side segment review, approval workflow
-  and a review UI, on a Next.js API.
+- **Reviewer sign-off** — reviewer identity, lock a segment as final, and carry
+  both onto the printed report.
 - **Certified export package** — source digest, translator declaration and
   reviewer sign-off in a single bundle.
 - **Diff-aware re-verification** — re-run checks without re-translating when the
