@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+import { computeCoverage } from "../src/lib/verify/alignment";
 import { splitSentences } from "../src/lib/domain/gujarati";
+import { buildReport } from "../src/lib/pipeline/report";
+import type { ReportInput, ReportNarrative } from "../src/lib/pipeline/report";
+import { chunkSegments, translateSegments } from "../src/lib/pipeline/translate";
+import type { Segment } from "../src/lib/pipeline/translate";
+import type { VerificationResult } from "../src/lib/pipeline/verify";
 import { extractAllDatums, extractPartyNames, datumsAgree } from "../src/lib/verify/datum";
 import { buildTermPlan, checkTermCompliance } from "../src/lib/verify/terminology";
 import type { Datum, DatumKind } from "../src/lib/domain";
@@ -120,5 +126,155 @@ describe("per-block terminology scope", () => {
       sourceText: "અરજીકર્તાએ જવાબ આપ્યો.",
     });
     expect(findings).toEqual([]);
+  });
+});
+
+// ── Report checks must reflect what actually happened ────────────────────────
+
+/** A VerificationResult with nothing checked yet, mirroring run.ts's baseline. */
+function emptyVerification(): VerificationResult {
+  return {
+    findings: [],
+    datums: [],
+    score: {
+      datumIntegrity: 0,
+      terminology: 0,
+      coverage: 0,
+      semantic: 0,
+      ocrConfidence: 0,
+      total: 0,
+      criticalCount: 0,
+      grade: "red",
+      certifiedReady: false,
+    },
+    alignment: { pairs: [], method: "positional", unmatchedSource: [], unmatchedTarget: [], exact: true },
+    coverage: { totalBlocks: 0, translatedBlocks: 0, emptyBlocks: [], stuntedBlocks: [], ratio: 0 },
+    termPlan: [],
+    judge: { segments: [], documentNotes: [], documentFaithful: true, available: false },
+    warnings: [],
+  };
+}
+
+const narrative: ReportNarrative = {
+  executiveSummary: "summary",
+  reviewFocus: [],
+  limitations: [],
+  recommendedAction: "action",
+  modelGenerated: false,
+};
+
+function reportInput(preflightWarnings: ReportInput["preflightWarnings"]): ReportInput {
+  return {
+    docId: "d-1",
+    fileName: "english-deed.docx",
+    docType: "property_document",
+    docTypeLabel: "Property document",
+    pageCount: 4,
+    providerLabel: "ollama:qwen2.5:14b",
+    segmentCount: 3,
+    verification: emptyVerification(),
+    preflightWarnings,
+    sourceSha256: "abc",
+    translatedAt: new Date().toISOString(),
+  };
+}
+
+describe("script and encoding preflight report check", () => {
+  // Regression: the check grepped the warning *text* for the literal word
+  // "preflight", but the warning produced by classify.ts says "No Gujarati or
+  // Devanagari script detected". The substring never matched, so the check
+  // reported PASS and the report asserted "Confirmed the source is Gujarati
+  // script" on an English document.
+  it("fails when preflight says the source is not Gujarati", () => {
+    const report = buildReport(
+      reportInput([{ code: "not_indic", severity: "warn", message: "No Gujarati or Devanagari script detected." }]),
+      narrative,
+    );
+    const check = report.mechanicalChecks.find((c) => c.check === "Script and encoding preflight");
+    expect(check?.passed).toBe(false);
+    expect(check?.count).toBe(1);
+  });
+
+  it("fails when a preflight issue is blocking", () => {
+    const report = buildReport(
+      reportInput([{ code: "low_gujarati", severity: "block", message: "Cannot proceed." }]),
+      narrative,
+    );
+    const check = report.mechanicalChecks.find((c) => c.check === "Script and encoding preflight");
+    expect(check?.passed).toBe(false);
+  });
+
+  it("passes when preflight raised nothing", () => {
+    const report = buildReport(reportInput([]), narrative);
+    const check = report.mechanicalChecks.find((c) => c.check === "Script and encoding preflight");
+    expect(check?.passed).toBe(true);
+    expect(check?.count).toBe(0);
+  });
+});
+
+describe("segments returned empty by the model", () => {
+  // Regression: when the model answered with ids that matched no segment we
+  // sent, translateChunk pushed target "" for every segment. Those indices were
+  // still present in the result, so the outer "missing segment" check never
+  // fired and the document came back wholly untranslated with no warning.
+  it("warns instead of reporting silent empty targets", async () => {
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async () => JSON.stringify({ segments: [{ index: 99, target: "wrong id" }] }),
+    };
+
+    const segments: Segment[] = [
+      { index: 0, blockId: "b0", source: "આરોપીને સજા થઈ.", kind: "body", pageNumber: 1, termHits: [] },
+      { index: 1, blockId: "b1", source: "અરજી માન્ય થઈ.", kind: "body", pageNumber: 1, termHits: [] },
+    ];
+
+    const outcome = await translateSegments(llm, segments, { docType: "property_document" });
+
+    expect(outcome.segments.map((s) => s.target)).toEqual(["", ""]);
+    expect(outcome.warnings.some((w) => w.includes("empty English text"))).toBe(true);
+    expect(outcome.warnings.some((w) => w.includes("Segment 0 was not returned"))).toBe(false);
+  });
+});
+
+describe("translation chunking", () => {
+  // Regression: only the source was budgeted, so 134 short English segments
+  // fit in one chunk. The reply is ~45 tokens of JSON per segment, the local
+  // model fell into a repetition loop, and Ollama aborted with "token repeat
+  // limit reached" — a short, off-schema response that left every target empty.
+  it("caps the segment count per chunk even when the token budget allows more", () => {
+    const segments: Segment[] = Array.from({ length: 80 }, (_, i) => ({
+      index: i,
+      blockId: `b${i}`,
+      source: "Towards North",
+      kind: "body",
+      pageNumber: 1,
+      termHits: [],
+    }));
+
+    const chunks = chunkSegments(segments, 1_000_000, 30);
+
+    expect(chunks.map((c) => c.segments.length)).toEqual([30, 30, 20]);
+    expect(chunks.flatMap((c) => c.segments.map((s) => s.index))).toEqual([...segments.map((s) => s.index)]);
+  });
+});
+
+describe("coverage stunting", () => {
+  // Regression: `expected` floors at 8 chars, so a short source whose target
+  // matched it exactly ("Road" -> "Road") was reported as "substantially
+  // shorter than its source" and flipped the report's Segment coverage check
+  // to a fail.
+  it("does not flag a target that is no shorter than its source", () => {
+    const c = computeCoverage(["Road", "Towards North"], ["Road", "Towards North"]);
+
+    expect(c.stuntedBlocks).toEqual([]);
+    expect(c.ratio).toBe(1);
+  });
+
+  it("still flags a target collapsed below its source", () => {
+    const c = computeCoverage(["x".repeat(200)], ["ab"]);
+
+    expect(c.stuntedBlocks).toEqual([0]);
   });
 });

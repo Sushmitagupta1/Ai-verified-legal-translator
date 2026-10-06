@@ -177,7 +177,11 @@ export function computeCoverage(
     }
     translated++;
     const expected = Math.max(8, Math.round(s.length * minRatio));
-    if (t.length < expected) stunted.push(i);
+    // The floor of 8 exists to catch a collapsed rendering of a real paragraph,
+    // but on a short source it fires on output that is no shorter than its
+    // input: "Road" -> "Road" was reported as a compressed translation. Only
+    // flag when the target is genuinely shorter than both thresholds.
+    if (t.length < expected && t.length < s.length) stunted.push(i);
   }
 
   return {

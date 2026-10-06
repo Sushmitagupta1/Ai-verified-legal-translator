@@ -27,8 +27,16 @@ export const config = {
 
   /** Target token budget per translation chunk (Gujarati source side). */
   chunkTokenBudget: envInt("NYD_CHUNK_TOKENS", 2600),
-  /** Hard ceiling on chunk size so a pathological paragraph cannot overflow the model. */
-  chunkHardLimitTokens: envInt("NYD_CHUNK_HARD_TOKENS", 4200),
+  /**
+   * Maximum segments per translation chunk.
+   *
+   * Token budget alone does not bound the *output*: each returned segment adds
+   * ~45 tokens of JSON boilerplate, so a budget-satisfying chunk of 130 short
+   * segments asks a local 14B model for ~8k output tokens. It degenerates into
+   * a repetition loop and Ollama aborts with "token repeat limit reached",
+   * which arrives as a short, off-schema response.
+   */
+  chunkMaxSegments: envInt("NYD_CHUNK_MAX_SEGMENTS", 30),
 
   /**
    * Below this OCR word-confidence the pipeline refuses to treat extracted text as

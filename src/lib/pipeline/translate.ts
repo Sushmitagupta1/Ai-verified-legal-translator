@@ -145,32 +145,36 @@ interface Chunk {
  * a split segment would break the 1:1 invariant the verifier depends on. A single
  * oversized segment is sent alone and flagged.
  */
-export function chunkSegments(segments: Segment[], budget = config.chunkTokenBudget): Chunk[] {
+export function chunkSegments(
+  segments: Segment[],
+  budget = config.chunkTokenBudget,
+  maxSegments = config.chunkMaxSegments,
+): Chunk[] {
   const chunks: Chunk[] = [];
   let current: Segment[] = [];
   let tokens = 0;
 
+  const flush = () => {
+    if (current.length > 0) chunks.push({ segments: current, tokens });
+    current = [];
+    tokens = 0;
+  };
+
   for (const seg of segments) {
     const t = estimateTokens(seg.source);
 
-    if (current.length > 0 && tokens + t > budget) {
-      chunks.push({ segments: current, tokens });
-      current = [];
-      tokens = 0;
-    }
+    // Bound by count as well as tokens. The budget measures the source only,
+    // but each returned segment adds ~45 tokens of JSON boilerplate, so a
+    // source-satisfying chunk of 130 short segments demands ~8k output tokens.
+    // A local 14B model cannot sustain that and Ollama aborts the prediction on
+    // its repeat limit, returning a short off-schema response.
+    if (current.length > 0 && (tokens + t > budget || current.length >= maxSegments)) flush();
 
     current.push(seg);
     tokens += t;
-
-    // Close a chunk once it is comfortably full so the next segment starts clean.
-    if (tokens >= budget * 0.92) {
-      chunks.push({ segments: current, tokens });
-      current = [];
-      tokens = 0;
-    }
   }
 
-  if (current.length > 0) chunks.push({ segments: current, tokens });
+  flush();
   return chunks;
 }
 
@@ -286,6 +290,29 @@ export async function translateSegments(
     opts.onProgress?.(done, toTranslate.length);
   }
 
+  // One bounded retry for segments the model returned empty. A local model
+  // occasionally drops a few ids inside a chunk; re-asking only for those is
+  // cheap and turns an omission into a translation. Bounded so a systemic
+  // failure (every segment empty) is not simply repeated at extra cost.
+  const emptyOut = out.filter((s) => !s.target);
+  if (emptyOut.length > 0 && emptyOut.length <= 40) {
+    const srcByIndex = new Map(segments.map((s) => [s.index, s] as const));
+    const toRetry = emptyOut
+      .map((s) => srcByIndex.get(s.index))
+      .filter((s): s is Segment => s !== undefined);
+
+    for (const chunk of chunkSegments(toRetry)) {
+      const retry = await translateChunk(llm, chunk, docContext, nameHints, termPlanText, "", opts);
+      calls += retry.calls;
+      ambiguous.push(...retry.ambiguousTerms);
+      for (const seg of retry.segments) {
+        if (!seg.target) continue;
+        const i = out.findIndex((o) => o.index === seg.index);
+        if (i >= 0) out[i] = seg;
+      }
+    }
+  }
+
   // Hard invariant: every input index appears exactly once in the output.
   //
   // All three sources are merged here: model output, passthrough, and
@@ -301,6 +328,12 @@ export async function translateSegments(
     byIndex.set(seg.index, seg);
   }
 
+  // An index can be present yet still carry an empty target: translateChunk
+  // pushes "" when the model returns the id list with a gap or different
+  // numbering. The missing-index check below only catches whole absences, so a
+  // document could come back 100% untranslated with no omission warning at all.
+  const presentButEmpty = [...byIndex.values()].filter((s) => !s.target).map((s) => s.index);
+
   const missing = segments.filter((s) => !byIndex.has(s.index));
   for (const seg of missing) {
     byIndex.set(seg.index, {
@@ -314,6 +347,15 @@ export async function translateSegments(
     warnings.push(`Segment ${seg.index} was not returned by the provider and is marked as an omission.`);
   }
 
+  if (presentButEmpty.length > 0) {
+    const shown = presentButEmpty.slice(0, 8).join(", ");
+    const more = presentButEmpty.length > 8 ? `, +${presentButEmpty.length - 8} more` : "";
+    warnings.push(
+      `${presentButEmpty.length} segment(s) came back with empty English text (index ${shown}${more}). ` +
+        "The model returned ids the pipeline could not match, so these are untranslated rather than verified.",
+    );
+  }
+
   return {
     segments: [...byIndex.values()].sort((a, b) => a.index - b.index),
     ambiguousTerms: ambiguous,
@@ -322,6 +364,21 @@ export async function translateSegments(
     warnings,
     locked: lockedOut,
   };
+}
+
+/**
+ * The prompt lists sources as `[0] text`, and a model that ignores the output
+ * schema echoes that label straight back as the id. Accept a bare number, a
+ * numeric string, or a bracketed one so the segment still lines up instead of
+ * silently producing an empty target.
+ */
+function parseSegmentId(v: number | string | undefined): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string") {
+    const m = /\d+/.exec(v);
+    if (m) return Number(m[0]);
+  }
+  return null;
 }
 
 async function translateChunk(
@@ -345,18 +402,41 @@ async function translateChunk(
       { role: "system", content: TRANSLATION_SYSTEM },
       { role: "user", content: user },
     ],
-    { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.max(4096, chunk.tokens * 3) },
+      { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.max(16_384, chunk.tokens * 6) },
   );
 
   const parsed = parseJson<{
-    segments?: Array<{ id?: number; index?: number; target?: string; confidence?: number; notes?: string[] }>;
+    segments?: Array<{
+      id?: number | string;
+      index?: number | string;
+      target?: string;
+      text?: string;
+      translation?: string;
+      confidence?: number;
+      notes?: string[];
+    }>;
     ambiguousTerms?: ChunkResult["ambiguousTerms"];
   }>(raw);
 
   const byId = new Map<number, { target?: string; confidence?: number; notes?: string[] }>();
   for (const s of parsed.segments ?? []) {
-    const id = s.id ?? s.index;
-    if (typeof id === "number") byId.set(id, s);
+    const id = parseSegmentId(s.id ?? s.index);
+    if (id === null) continue;
+    byId.set(id, {
+      target: s.target ?? s.text ?? s.translation ?? "",
+      confidence: s.confidence,
+      notes: s.notes,
+    });
+  }
+
+  if (process.env.NYD_DEBUG_TRANSLATION === "1") {
+    const ids = chunk.segments.map((s) => s.index);
+    console.log(
+      `[chunk] sent=${ids.length} range=${ids[0]}..${ids[ids.length - 1]} byId=${byId.size} ` +
+        `returned=[${[...byId.keys()].slice(0, 8).join(",")}] rawLen=${raw.length}`,
+    );
+    console.log(`[promptHead] ${JSON.stringify(user.slice(0, 260))}`);
+    console.log(`[promptTail] ${JSON.stringify(user.slice(-260))}`);
   }
 
   const segments: TranslatedSegment[] = [];

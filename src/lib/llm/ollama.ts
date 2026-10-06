@@ -30,16 +30,22 @@ export function createOllama(): LlmClient {
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (opts.signal?.aborted) throw new LlmError("Aborted", false);
         try {
+          const body: Record<string, unknown> = {
+            model: useModel,
+            messages: messages.map((m) => ({ role: m.role, content: m.content })),
+            temperature: opts.temperature ?? config.llm.temperature,
+            max_tokens: opts.maxOutputTokens ?? 8_192,
+            stream: false,
+          };
+          // Without this the local model free-forms the schema: it echoed the
+          // prompt's `[67]` label as a string id and used `text` instead of
+          // `target`, so every segment came back unmatched and untranslated.
+          if (opts.json) body.response_format = { type: "json_object" };
+
           const res = await fetch(`${baseUrl}/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              model: useModel,
-              messages: messages.map((m) => ({ role: m.role, content: m.content })),
-              temperature: opts.temperature ?? config.llm.temperature,
-              max_tokens: opts.maxOutputTokens ?? 8_192,
-              stream: false,
-            }),
+            body: JSON.stringify(body),
             signal: opts.signal,
           });
 

@@ -25,6 +25,14 @@ export interface ReportInput {
   /** Target block list, aligned with `blocks` in the verification result. */
   segmentCount: number;
   verification: VerificationResult;
+  /**
+   * Structured script/encoding warnings from preflight.
+   *
+   * The report must not claim the source is Gujarati unless this is empty: a
+   * `not_indic` finding on an English document used to be reported as a pass,
+   * which reads as a positive assurance on a legal verification report.
+   */
+  preflightWarnings?: Array<{ code: string; severity: string; message: string }>;
   /** Source hash shown in the report so a reviewer can pin the exact input. */
   sourceSha256: string;
   translatedAt: string;
@@ -91,13 +99,25 @@ export function buildReport(input: ReportInput, narrative: ReportNarrative): Ver
   const datumCount = v.datums.length;
   const changedOrMissing = v.datums.filter((d) => d.status === "changed" || d.status === "missing" || d.status === "added").length;
   const termHits = v.termPlan.reduce((a, t) => a + t.count, 0);
+  const preflightIssues = input.preflightWarnings ?? [];
+  // Codes that invalidate the "source is Gujarati script" claim below. Anything
+  // blocking also invalidates it.
+  const scriptConfirmed =
+    !preflightIssues.some(
+      (w) => w.severity === "block" || ["not_indic", "wrong_script", "legacy_encoding"].includes(w.code),
+    ) && !v.findings.some((f) => f.check.startsWith("source."));
 
   const mechanicalChecks = [
     {
       check: "Script and encoding preflight",
-      description: "Confirmed the source is Gujarati script and not a legacy Indic font encoding that would silently corrupt names and digits.",
-      count: 1,
-      passed: v.warnings.every((w) => !w.includes("preflight")) && !v.findings.some((f) => f.check.startsWith("source.")),
+      description: scriptConfirmed
+        ? "Confirmed the source is Gujarati script and not a legacy Indic font encoding that would silently corrupt names and digits."
+        : `Not confirmed: ${
+            preflightIssues.map((w) => w.message).join(" ") ||
+            "a source-level verification finding contradicts the Gujarati script claim."
+          }`,
+      count: preflightIssues.length,
+      passed: scriptConfirmed,
     },
     {
       check: "Data extraction and comparison",

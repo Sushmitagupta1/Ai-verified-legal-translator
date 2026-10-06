@@ -301,6 +301,7 @@ function makeReportInput(
     providerLabel: providerDisplayName(llm),
     segmentCount,
     verification,
+    preflightWarnings: prepared.preflight.warnings,
     sourceSha256: sha256,
     translatedAt: new Date().toISOString(),
     reviewer: get<{ reviewer: string | null }>("SELECT reviewer FROM documents WHERE id = ?", opts.documentId)?.reviewer ?? null,
