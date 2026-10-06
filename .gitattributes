@@ -1,0 +1,21 @@
+# Normalise line endings so Windows checkouts do not produce CRLF diffs.
+# The repository stores LF; git checks out CRLF locally on Windows.
+* text=auto eol=lf
+
+# Windows-native files that genuinely need CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files — never touched
+*.pdf binary
+*.docx binary
+*.db binary
+*.db-shm binary
+*.db-wal binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.webp binary
