@@ -96,7 +96,6 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   let prepared: ReturnType<typeof prepare>;
   let translated: TranslatedSegment[] = [];
   let segments: Segment[] = [];
-  let verification: VerificationResult;
 
   if (opts.verifyOnly) {
     const stored = loadBlocks(opts.documentId);
@@ -233,7 +232,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
     targetByBlock.set(seg.blockId, joinTarget(targetByBlock.get(seg.blockId), seg.target));
   }
 
-  verification = await verifyDocument(
+  const verification = await verifyDocument(
     llm,
     {
       sourceTexts,
