@@ -102,8 +102,8 @@ correct.
 ## Installation
 
 ```bash
-git clone https://github.com/Sushmitagupta1/nyayadoot.git
-cd nyayadoot
+git clone https://github.com/Sushmitagupta1/Ai-verified-legal-translator.git
+cd Ai-verified-legal-translator
 npm install
 ```
 
