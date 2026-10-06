@@ -469,14 +469,21 @@ function termFinding(
  * Untranslated Gujarati in the English column is caught here rather than by the
  * judge because it is mechanically detectable and unambiguous.
  */
-function verifyStructure(input: VerifyInput): {
+export function verifyStructure(input: VerifyInput): {
   findings: Finding[];
   alignment: AlignmentResult;
   coverage: ReturnType<typeof computeCoverage>;
 } {
   const findings: Finding[] = [];
 
-  const srcSentences = input.sourceTexts.flatMap((t) => (t.trim() ? [t] : []));
+  // Alignment has to compare like with like. `sourceTexts` is one entry per
+  // block, but the unit of translation is a sentence (buildSegments splits every
+  // block), so a paragraph-heavy document always produced more target segments
+  // than source entries and the surplus was reported as hallucinated content —
+  // a critical finding against text that was in the source all along. Take the
+  // source side from the segments themselves, which is exactly the granularity
+  // the translation stage worked in.
+  const srcSentences = input.translated.map((t) => t.source).filter((t) => t.trim().length > 0);
   const tgtSentences = input.translated.filter((t) => t.target.trim().length > 0).map((t) => t.target);
   const alignment = alignSegments(srcSentences, tgtSentences);
   const coverage = computeCoverage(input.sourceTexts, input.blockIds.map((b) => input.targetByBlock.get(b) ?? ""));
