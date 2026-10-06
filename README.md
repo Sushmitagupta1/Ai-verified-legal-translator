@@ -167,7 +167,7 @@ be set. **No API key is required for Ollama.**
 | `NYD_CONCURRENCY` | `3` | Parallel model calls inside one document job |
 | **Chunking** | | |
 | `NYD_CHUNK_TOKENS` | `2600` | Target tokens per translation chunk |
-| `NYD_CHUNK_HARD_TOKENS` | `4200` | Hard ceiling so one paragraph cannot overflow |
+| `NYD_CHUNK_MAX_SEGMENTS` | `30` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
 | `NYD_MAX_PAGES` | `400` | Page ceiling per document |
 | `NYD_MAX_UPLOAD_MB` | `64` | Upload size limit |
 | **Storage** | | |
