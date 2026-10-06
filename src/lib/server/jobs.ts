@@ -55,41 +55,84 @@ const globals = globalThis as typeof globalThis & JobsGlobals;
 const live: Map<string, JobState> = (globals.__nydLiveJobs ??= new Map());
 
 /**
- * When this process booted, so a sweep can tell "left behind by a process that
- * died" from "started by this one".
+ * When this process booted, used only for job rows that predate pid tracking.
  *
- * Age is the only safe test: a route bundle evaluates this file once per
- * instance, so any "have I swept yet?" flag can fire again while a run started
- * elsewhere is still in flight — and fail the job row out from under it.
+ * Age alone is not enough: `next dev` runs a parent and a child process, and a
+ * child that boots after a run has started will see that run as "older than me"
+ * and fail it out from under a live pipeline. Which process owns the run is the
+ * question that actually matters, and that is what the pid in the payload asks.
  */
 const PROCESS_STARTED_AT = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
+/**
+ * Signal numbers that mean "this pid does not exist" rather than "try again".
+ * ESRCH says it does not, EPERM says it does but belongs to someone else, and
+ * EINVAL/ERANGE say the number was never a pid at all (Windows rejects absurd
+ * values outright). Anything else is ambiguous, and ambiguity should keep the
+ * job running rather than kill it.
+ */
+const DEAD_PID_CODES = new Set(["ESRCH", "EINVAL", "ERANGE"]);
 
 sweepOrphanedJobs();
 
 /**
+ * Is `pid` a process this machine can still signal?
+ *
+ * `kill(pid, 0)` sends nothing; it only asks the kernel whether the pid exists.
+ */
+function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !DEAD_PID_CODES.has((err as NodeJS.ErrnoException).code ?? "");
+  }
+}
+
+/**
  * A process killed mid-run leaves its job row `running` with nothing to finish
  * it, and the UI would show a progress bar that never moves. Fail those, and
- * leave anything this process could still be working on alone.
+ * leave anything owned by a live process alone — whatever its start time says.
  */
 function sweepOrphanedJobs(): void {
-  const orphans = all<{ id: string; document_id: string }>(
-    `SELECT id, document_id FROM jobs
-      WHERE status IN ('queued', 'running')
-        AND created_at < ?`,
-    PROCESS_STARTED_AT,
-  ).filter((row) => !live.has(row.document_id));
+  const candidates = all<{ id: string; document_id: string; payload: string | null; created_at: string }>(
+    `SELECT id, document_id, payload, created_at FROM jobs
+      WHERE status IN ('queued', 'running')`,
+  );
 
-  for (const orphan of orphans) {
+  for (const row of candidates) {
+    if (live.has(row.document_id)) continue;
+
+    const pid = readPid(row.payload);
+    if (pid != null) {
+      if (processAlive(pid)) continue;
+    } else if (row.created_at >= PROCESS_STARTED_AT) {
+      // No pid recorded, but the row was created after this process booted —
+      // it belongs to this one, so leave it alone.
+      continue;
+    }
+
     const now = new Date().toISOString();
     const message = "Interrupted — the server stopped before this run finished. Run it again.";
-    run(`UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`, message, now, orphan.id);
+    run(`UPDATE jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`, message, now, row.id);
     run(
       `UPDATE documents SET status = 'failed', stage = 'failed', error = ?, updated_at = ?
         WHERE id = ? AND status = 'running'`,
       message,
       now,
-      orphan.document_id,
+      row.document_id,
     );
+  }
+}
+
+function readPid(payload: string | null | undefined): number | null {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as { pid?: unknown };
+    return typeof parsed.pid === "number" ? parsed.pid : null;
+  } catch {
+    return null;
   }
 }
 
@@ -194,9 +237,10 @@ export function startJob(documentId: string): JobState {
   const jobId = `j-${randomUUID().slice(0, 8)}`;
   run(
     `INSERT INTO jobs (id, document_id, kind, status, payload, attempts, created_at)
-     VALUES (?, ?, 'pipeline', 'queued', '{}', 0, ?)`,
+     VALUES (?, ?, 'pipeline', 'queued', ?, 0, ?)`,
     jobId,
     documentId,
+    JSON.stringify({ pid: process.pid }),
     new Date().toISOString(),
   );
 
@@ -235,7 +279,11 @@ function recordProgress(state: JobState, stage: Stage, detail: string, pct: numb
   lastWritten.set(state, { stage, pct: rounded });
 
   try {
-    run(`UPDATE jobs SET payload = ? WHERE id = ?`, JSON.stringify({ stage, detail, pct }), state.jobId);
+    run(
+      `UPDATE jobs SET payload = ? WHERE id = ?`,
+      JSON.stringify({ pid: process.pid, stage, detail, pct }),
+      state.jobId,
+    );
   } catch {
     // Progress reporting must never fail the pipeline.
   }
@@ -252,7 +300,11 @@ async function execute(doc: DocumentRow, state: JobState, buffer: Buffer): Promi
     startedAt,
     state.jobId,
   );
-  run(`UPDATE documents SET status = 'running', updated_at = ? WHERE id = ?`, startedAt, doc.id);
+  run(
+    `UPDATE documents SET status = 'running', error = NULL, updated_at = ? WHERE id = ?`,
+    startedAt,
+    doc.id,
+  );
 
   try {
     await runPipeline({
