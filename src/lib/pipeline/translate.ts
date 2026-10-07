@@ -280,11 +280,20 @@ export async function translateSegments(
   let priorContext = "";
 
   for (const chunk of chunks) {
-    const result = await translateChunk(llm, chunk, docContext, nameHints, termPlanText, priorContext, opts);
-    priorContext = result.contextCarry;
-    calls += result.calls;
-    ambiguous.push(...result.ambiguousTerms);
-    for (const seg of result.segments) out.push(seg);
+    const outcome = await translateChunkWithFallback(
+      llm,
+      chunk,
+      docContext,
+      nameHints,
+      termPlanText,
+      priorContext,
+      opts,
+      warnings,
+    );
+    priorContext = outcome.contextCarry;
+    calls += outcome.calls;
+    ambiguous.push(...outcome.ambiguousTerms);
+    for (const seg of outcome.segments) out.push(seg);
 
     done += chunk.segments.length;
     opts.onProgress?.(done, toTranslate.length);
@@ -302,7 +311,8 @@ export async function translateSegments(
       .filter((s): s is Segment => s !== undefined);
 
     for (const chunk of chunkSegments(toRetry)) {
-      const retry = await translateChunk(llm, chunk, docContext, nameHints, termPlanText, "", opts);
+      const retry = await translateChunkWithFallback(llm, chunk, docContext, nameHints, termPlanText, "", opts, warnings);
+      if (retry.chunkFailed) continue;
       calls += retry.calls;
       ambiguous.push(...retry.ambiguousTerms);
       for (const seg of retry.segments) {
@@ -427,7 +437,7 @@ async function translateChunk(
       { role: "system", content: TRANSLATION_SYSTEM },
       { role: "user", content: user },
     ],
-      { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.max(16_384, chunk.tokens * 6) },
+      { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.min(8_192, Math.max(4_096, chunk.tokens * 6)) },
   );
 
   const parsed = parseJson<{
@@ -521,6 +531,50 @@ async function translateChunk(
     calls: 1,
     contextCarry: tail,
   };
+}
+
+/**
+ * Run one chunk of translation, turning a hard provider failure into omission
+ * markers rather than aborting the whole document.
+ *
+ * A local 14B model degenerates into repetition loops on long OCR'd chunks;
+ * Ollama answers 500 "token repeat limit reached" and after the retry budget a
+ * bare translateChunk would throw, taking the entire run - and with it the
+ * user's Word/PDF export - down. Better to mark the chunk's segments as
+ * omissions and let the report show exactly which pages still need a human.
+ */
+async function translateChunkWithFallback(
+  llm: LlmClient,
+  chunk: Chunk,
+  docContext: string,
+  nameHints: string[],
+  termPlanText: string,
+  priorContext: string,
+  opts: TranslateOptions,
+  warnings: string[],
+): Promise<ChunkResult & { calls: number; contextCarry: string; chunkFailed: boolean }> {
+  try {
+    return { ...(await translateChunk(llm, chunk, docContext, nameHints, termPlanText, priorContext, opts)), chunkFailed: false };
+  } catch (err) {
+    const message = err instanceof Error ? err.message.split("\n")[0].slice(0, 200) : "unknown error";
+    warnings.push(
+      `Translation chunk failed after retries (${message}); its ${chunk.segments.length} segment(s) are marked as omissions.`,
+    );
+    return {
+      segments: chunk.segments.map((seg) => ({
+        index: seg.index,
+        blockId: seg.blockId,
+        source: seg.source,
+        target: seg.passthrough ? seg.source : "",
+        confidence: 0,
+        notes: ["OMISSION: translation chunk failed; not verified."],
+      })),
+      ambiguousTerms: [],
+      calls: 1,
+      contextCarry: "",
+      chunkFailed: true,
+    };
+  }
 }
 
 /**

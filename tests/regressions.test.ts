@@ -335,3 +335,31 @@ describe("object-shaped model responses", () => {
     expect(outcome.ambiguousTerms.length).toBe(1);
   });
 });
+
+describe("a translation chunk that cannot be translated", () => {
+  // Regression: a long OCR'd chunk pushed a local 14B model into a repetition
+  // loop until Ollama aborted with "token repeat limit reached". The provider
+  // threw after its retry budget, which aborted the whole run - and the
+  // document (and its Word/PDF exports) never completed.
+  it("marks the chunk's segments as omissions instead of failing the run", async () => {
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async () => {
+        throw new Error("Ollama 500: prediction aborted, token repeat limit reached");
+      },
+    };
+
+    const segments: Segment[] = [
+      { index: 0, blockId: "b0", source: "આ વેચાણપત્ર રજીસ્ટર કરાયું.", kind: "body", pageNumber: 1, termHits: [] },
+      { index: 1, blockId: "b1", source: "કિંમત ત્રણ લાખ રૂપિયા છે.", kind: "body", pageNumber: 1, termHits: [] },
+    ];
+
+    const outcome = await translateSegments(llm, segments, { docType: "property_document" });
+
+    expect(outcome.segments.map((s) => s.target)).toEqual(["", ""]);
+    expect(outcome.segments.every((s) => (s.notes ?? []).join(" ").includes("OMISSION"))).toBe(true);
+    expect(outcome.warnings.some((w) => w.includes("chunk failed"))).toBe(true);
+  });
+});

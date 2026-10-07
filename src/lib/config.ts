@@ -26,7 +26,7 @@ export const config = {
   maxPages: envInt("NYD_MAX_PAGES", 400),
 
   /** Target token budget per translation chunk (Gujarati source side). */
-  chunkTokenBudget: envInt("NYD_CHUNK_TOKENS", 2600),
+  chunkTokenBudget: envInt("NYD_CHUNK_TOKENS", 1800),
   /**
    * Maximum segments per translation chunk.
    *
@@ -35,8 +35,11 @@ export const config = {
    * segments asks a local 14B model for ~8k output tokens. It degenerates into
    * a repetition loop and Ollama aborts with "token repeat limit reached",
    * which arrives as a short, off-schema response.
+   *
+   * The cookie jars to a 4096-token context too: a Q4 14B on an 8 GiB GPU has
+   * no room for a bigger num_ctx, so prompt + response must both fit 4096.
    */
-  chunkMaxSegments: envInt("NYD_CHUNK_MAX_SEGMENTS", 30),
+  chunkMaxSegments: envInt("NYD_CHUNK_MAX_SEGMENTS", 20),
 
   /**
    * Below this OCR word-confidence the pipeline refuses to treat extracted text as
