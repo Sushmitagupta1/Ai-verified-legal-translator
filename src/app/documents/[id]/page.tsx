@@ -292,6 +292,20 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
             </a>
           </div>
         ) : null}
+
+        {finished && !running && doc.status !== "failed" ? (
+          <div className="row" style={{ marginTop: 8 }}>
+            <a className="btn ghost" href={`/api/documents/${id}/export/txt?kind=tcr`}>
+              TCR .txt
+            </a>
+            <a className="btn ghost" href={`/api/documents/${id}/export/pdf?kind=tcr`}>
+              TCR .pdf
+            </a>
+            <a className="btn ghost" href={`/api/documents/${id}/export/docx?kind=tcr`}>
+              TCR .docx
+            </a>
+          </div>
+        ) : null}
       </div>
 
       {report ? (
