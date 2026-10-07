@@ -272,7 +272,12 @@ function findExecutable(name: string): string | null {
   for (const dir of pathVar.split(process.platform === "win32" ? ";" : ":")) {
     if (!dir) continue;
     for (const ext of exts) {
-      const candidate = pathJoin(dir, `${name}${ext}`);
+      // The callers already include the extension on Windows ("tesseract.exe");
+      // appending PATHEXT again would probe "tesseract.exe.EXE" and never match.
+      const candidate =
+        name.toLowerCase().endsWith(ext.toLowerCase()) || !ext
+          ? pathJoin(dir, name)
+          : pathJoin(dir, `${name}${ext}`);
       try {
         if (fsSync.statSync(candidate).isFile()) return candidate;
       } catch {

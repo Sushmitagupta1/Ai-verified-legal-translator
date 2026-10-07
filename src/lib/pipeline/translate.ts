@@ -381,6 +381,31 @@ function parseSegmentId(v: number | string | undefined): number | null {
   return null;
 }
 
+/**
+ * A local model occasionally returns `segments` or `ambiguousTerms` as an
+ * object keyed by id rather than as an array. Both shapes are accepted here so
+ * a single off-schema chunk degrades to per-segment omissions instead of
+ * aborting translation of the whole document.
+ */
+function asArray<T>(v: T[] | Record<string, T> | null | undefined): T[] {
+  if (Array.isArray(v)) return v;
+  if (v && typeof v === "object") return Object.values(v) as T[];
+  return [];
+}
+
+/**
+ * Normalise a possibly object-keyed response into `[key, item]` pairs.
+ *
+ * When the model answers with `{"segments": {"0": {...}, "1": {...}}}` the
+ * values carry no id of their own — the key *is* the id — so the positions
+ * keep the key alongside the item for the parser to fall back on.
+ */
+function entriesOf<T>(v: T[] | Record<string, T> | null | undefined): Array<[string, T]> {
+  if (Array.isArray(v)) return v.map((item, i) => [String(i), item] as [string, T]);
+  if (v && typeof v === "object") return Object.entries(v as Record<string, T>);
+  return [];
+}
+
 async function translateChunk(
   llm: LlmClient,
   chunk: Chunk,
@@ -418,9 +443,11 @@ async function translateChunk(
     ambiguousTerms?: ChunkResult["ambiguousTerms"];
   }>(raw);
 
+  const segmentList = entriesOf(parsed?.segments);
   const byId = new Map<number, { target?: string; confidence?: number; notes?: string[] }>();
-  for (const s of parsed.segments ?? []) {
-    const id = parseSegmentId(s.id ?? s.index);
+  for (const [key, s] of segmentList) {
+    const keyId = /^\d+$/.test(key) ? Number(key) : undefined;
+    const id = parseSegmentId(s.id ?? s.index ?? keyId);
     if (id === null) continue;
     byId.set(id, {
       target: s.target ?? s.text ?? s.translation ?? "",
@@ -488,7 +515,12 @@ async function translateChunk(
     .map((s) => `${s.source} → ${byId.get(s.index)?.target ?? "(untranslated)"}`)
     .join("\n");
 
-  return { segments, ambiguousTerms: parsed.ambiguousTerms ?? [], calls: 1, contextCarry: tail };
+  return {
+    segments,
+    ambiguousTerms: asArray(parsed?.ambiguousTerms),
+    calls: 1,
+    contextCarry: tail,
+  };
 }
 
 /**

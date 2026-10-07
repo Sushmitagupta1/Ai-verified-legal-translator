@@ -278,3 +278,60 @@ describe("coverage stunting", () => {
     expect(c.stuntedBlocks).toEqual([0]);
   });
 });
+
+describe("object-shaped model responses", () => {
+  // Regression: a local model occasionally answers with `segments` as an object
+  // keyed by id instead of an array. translateChunk iterated the value directly,
+  // so `for (const s of parsed.segments)` threw "object is not iterable" and
+  // aborted translation of the whole document mid-run.
+  it("accepts segments given as an object keyed by id", async () => {
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async () =>
+        JSON.stringify({
+          segments: {
+            "0": { target: "This deed is made today." },
+            "1": { target: "An agreement was reached between the parties." },
+          },
+        }),
+    };
+
+    const segments: Segment[] = [
+      { index: 0, blockId: "b0", source: "આ વેચાણપત્ર આજે કરવામાં આવે છે.", kind: "body", pageNumber: 1, termHits: [] },
+      { index: 1, blockId: "b1", source: "પક્ષકારો વચ્ચે કરાર થયો.", kind: "body", pageNumber: 1, termHits: [] },
+    ];
+
+    const outcome = await translateSegments(llm, segments, { docType: "property_document" });
+
+    expect(outcome.segments.map((s) => s.index)).toEqual([0, 1]);
+    expect(outcome.segments.every((s) => s.target.length > 0)).toBe(true);
+  });
+
+  it("accepts ambiguousTerms given as an object", async () => {
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async () =>
+        JSON.stringify({
+          segments: [
+            { id: 0, target: "registration" },
+            { id: 1, target: "mutations" },
+          ],
+          ambiguousTerms: { "0": { surface: "નોંધણી", chosen: "registration", alternatives: ["record"], reason: "context" } },
+        }),
+    };
+
+    const segments: Segment[] = [
+      { index: 0, blockId: "b0", source: "નોંધણી વિશે જણાવેલ છે.", kind: "body", pageNumber: 1, termHits: [] },
+      { index: 1, blockId: "b1", source: "નામાંતરણ વિશે જણાવેલ છે.", kind: "body", pageNumber: 1, termHits: [] },
+    ];
+
+    const outcome = await translateSegments(llm, segments, { docType: "property_document" });
+
+    expect(outcome.segments.every((s) => s.target.length > 0)).toBe(true);
+    expect(outcome.ambiguousTerms.length).toBe(1);
+  });
+});
