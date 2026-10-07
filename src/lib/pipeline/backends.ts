@@ -336,9 +336,17 @@ async function runTesseract(bin: string, buffer: Buffer, langs: string, mime: st
   const img = path.join(dir, `page.${ext}`);
   try {
     await fs.writeFile(img, buffer);
-    const { stdout } = await execFileAsync(bin, [img, "stdout", "-l", langs, "--psm", "3", "tsv"], {
-      maxBuffer: 256 * 1024 * 1024,
-    });
+    // TSV is enabled through the `-c` parameter rather than the `tsv`
+    // configfile, because configfiles are looked up inside the same tessdata
+    // tree as the traineddata. When TESSDATA_PREFIX is overridden (which is how
+    // packaged deployments carry extra language packs) that tree has no configs,
+    // so the configfile would silently fail and Tesseract would fall back to
+    // plain-text output that the tab-based parser below cannot read.
+    const { stdout } = await execFileAsync(
+      bin,
+      [img, "stdout", "-l", langs, "--psm", "3", "-c", "tessedit_create_tsv=1"],
+      { maxBuffer: 256 * 1024 * 1024 },
+    );
     return parseTesseractTsv(stdout);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
