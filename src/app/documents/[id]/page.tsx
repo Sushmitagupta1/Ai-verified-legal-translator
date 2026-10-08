@@ -213,7 +213,7 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
           <div>
             <h1 style={{ margin: 0 }}>{doc.file_name}</h1>
             <div className="muted small">
-              {doc.detected_type ?? doc.declared_type ?? "unknown type"}
+              {doc.declared_type ?? doc.detected_type ?? "unknown type"}
               {doc.type_confidence != null ? ` · confidence ${doc.type_confidence.toFixed(3)}` : ""} ·{" "}
               {doc.page_count || "?"} pages · {data.blockCount} blocks · {data.segmentCount} segments ·
               uploaded {formatDate(doc.created_at)}

@@ -329,9 +329,17 @@ export async function generateNarrative(
       // An unusable response still yields a usable (if blunt) narrative rather
       // than aborting the run: the report must always exist so a human can review.
       return {
-        executiveSummary: "Narrative generation returned no usable summary.",
+        executiveSummary:
+          `${input.fileName} was processed as a ${input.docTypeLabel} of ${input.pageCount} page(s). ` +
+          `Automated checks examined ${counts.datumCount} data item(s) and ${counts.termCount} terminology occurrence(s) ` +
+          `across ${counts.blocks} block(s). ${counts.findings} finding(s) were raised, of which ${counts.critical} are critical. ` +
+          "The translation provider could not produce a usable narrative, so the fidelity indicator reflects mechanical checks only. " +
+          "This translation is not certified and must be reviewed by a qualified legal professional before use.",
         reviewFocus: ["The findings table below, in severity order."],
-        limitations: ["The model's narrative summary could not be read as JSON."],
+        limitations: [
+          "The model's narrative summary could not be read as JSON; this narrative is generated from the automated checks.",
+          "Semantic equivalence, modality and negation were not assessed.",
+        ],
         recommendedAction: "Review the automated findings manually before relying on this translation.",
         modelGenerated: false,
       };

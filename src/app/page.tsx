@@ -124,9 +124,9 @@ export default function HomePage() {
                   <option value="affidavit">Affidavit</option>
                   <option value="contract">Contract</option>
                   <option value="property_document">Property document</option>
-                  <option value="court_filing">Court filing</option>
-                  <option value="notice">Notice</option>
-                  <option value="power_of_attorney">Power of attorney</option>
+                  <option value="court_judgment">Court judgment</option>
+                  <option value="court_order">Court order</option>
+                  <option value="legal_notice">Legal notice</option>
                 </select>
               </label>
               <label className="field">
