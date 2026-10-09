@@ -277,26 +277,52 @@ export async function translateSegments(
   let calls = 0;
   let done = 0;
 
-  let priorContext = "";
+  // Chunks run in a bounded worker pool instead of one at a time; Ollama serves
+  // concurrent requests, so a sequential loop leaves most of the machine idle.
+  // The only cross-chunk dependency is the tail of the previous chunk carried
+  // into the next prompt, so a worker uses the tail of the chunk before it when
+  // that chunk has already finished and otherwise the most recent completed
+  // tail ("" for the first chunk). Entity spellings and terminology reach every
+  // prompt document-wide via `nameHints` and the term plan, so this ordering
+  // slack does not reintroduce the drift the carry exists to prevent.
+  const tails: string[] = new Array(chunks.length).fill("");
+  const results: Array<Awaited<ReturnType<typeof translateChunkWithFallback>>> = [];
+  let next = 0;
+  let chainTail = "";
 
-  for (const chunk of chunks) {
-    const outcome = await translateChunkWithFallback(
-      llm,
-      chunk,
-      docContext,
-      nameHints,
-      termPlanText,
-      priorContext,
-      opts,
-      warnings,
-    );
-    priorContext = outcome.contextCarry;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= chunks.length) return;
+      const chunk = chunks[i];
+      const prior = i === 0 ? "" : tails[i - 1] || chainTail;
+      const outcome = await translateChunkWithFallback(
+        llm,
+        chunk,
+        docContext,
+        nameHints,
+        termPlanText,
+        prior,
+        opts,
+        warnings,
+      );
+      results[i] = outcome;
+      tails[i] = outcome.contextCarry;
+      if (outcome.contextCarry) chainTail = outcome.contextCarry;
+
+      done += chunk.segments.length;
+      opts.onProgress?.(done, toTranslate.length);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(config.pipeline.concurrency, chunks.length)) }, () => worker()));
+
+  // Aggregate in chunk order so calls and ambiguous terms stay deterministic
+  // regardless of which worker finished first.
+  for (const outcome of results) {
     calls += outcome.calls;
     ambiguous.push(...outcome.ambiguousTerms);
     for (const seg of outcome.segments) out.push(seg);
-
-    done += chunk.segments.length;
-    opts.onProgress?.(done, toTranslate.length);
   }
 
   // One bounded retry for segments the model returned empty. A local model
