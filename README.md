@@ -138,6 +138,11 @@ NYD_LLM_MODEL=qwen2.5:14b
 curl -fsSL https://ollama.com/install.sh | sh   # Linux
 ollama pull qwen2.5:14b                          # ~9 GB
 
+# the context window a local model gets. Ollama's default of 4096 is smaller
+# than one translation prompt, and a truncated prompt produces a short,
+# off-schema reply - the whole chunk comes back untranslated.
+export OLLAMA_CONTEXT_LENGTH=16384
+
 # run the pipeline
 export NYD_LLM_PROVIDER=ollama
 export NYD_LLM_MODEL=qwen2.5:14b
@@ -151,6 +156,12 @@ be set. **No API key is required for Ollama.**
 > they produce more findings than a hosted model. Budget human review
 > accordingly.
 
+> **One model at a time on one GPU.** `NYD_CONCURRENCY` defaults to `1` for this
+> reason. Ollama serves a second request only by sharing the same GPU, so
+> parallel chunks each run proportionally slower and are the first to cross the
+> per-request timeout — which cancels them mid-generation and leaves their
+> segments untranslated. Raise the setting only for a hosted API.
+
 ### All variables
 
 | Variable | Default | Purpose |
@@ -162,12 +173,12 @@ be set. **No API key is required for Ollama.**
 | `NYD_LLM_BASE_URL` | *(provider default)* | OpenAI-compatible endpoint |
 | `NYD_LLM_TEMPERATURE` | `0` | Kept at 0 — this is not a creative task |
 | `NYD_LLM_RETRIES` | `4` | Retry attempts with exponential backoff |
-| `NYD_LLM_TIMEOUT_MS` | `300000` | Per-request timeout; must outlast one translation chunk on a local model |
+| `NYD_LLM_TIMEOUT_MS` | `600000` | Per-request timeout; must outlast one translation chunk on a local model |
 | `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
-| `NYD_CONCURRENCY` | `3` | Parallel model calls inside one document job |
+| `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; raise it for hosted providers, leave it at 1 for a local model on one GPU |
 | **Chunking** | | |
-| `NYD_CHUNK_TOKENS` | `2600` | Target tokens per translation chunk |
-| `NYD_CHUNK_MAX_SEGMENTS` | `30` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
+| `NYD_CHUNK_TOKENS` | `1800` | Target tokens per translation chunk |
+| `NYD_CHUNK_MAX_SEGMENTS` | `20` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
 | `NYD_MAX_PAGES` | `400` | Page ceiling per document |
 | `NYD_MAX_UPLOAD_MB` | `64` | Upload size limit |
 | **Storage** | | |

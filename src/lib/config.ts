@@ -56,7 +56,18 @@ export const config = {
     baseUrl: process.env.NYD_LLM_BASE_URL ?? "",
     temperature: Number(process.env.NYD_LLM_TEMPERATURE ?? 0),
     maxRetries: envInt("NYD_LLM_RETRIES", 4),
-    timeoutMs: envInt("NYD_LLM_TIMEOUT_MS", 300_000),
+    /**
+     * Per-request timeout.
+     *
+     * A local model translating a 1,400-token chunk emits several hundred JSON
+     * tokens at 10-30 tok/s, so a chunk legitimately takes two to five minutes
+     * on a single consumer GPU. A 300s cap does not make a slow chunk fast, it
+     * aborts a healthy one - the request is cancelled mid-generation, the reply
+     * is unparseable, and every segment in that chunk is reported as an
+     * omission. The timeout must outlast the slowest realistic chunk, not the
+     * fastest one.
+     */
+    timeoutMs: envInt("NYD_LLM_TIMEOUT_MS", 600_000),
     /** Judge pass runs at a different (usually stronger) model when configured. */
     judgeModel: process.env.NYD_JUDGE_MODEL ?? "",
   },
@@ -72,8 +83,18 @@ export const config = {
   },
 
   pipeline: {
-    /** Concurrency for independent LLM calls inside a single document job. */
-    concurrency: envInt("NYD_CONCURRENCY", 3),
+    /**
+     * Concurrency for independent LLM calls inside a single document job.
+     *
+     * Defaults to 1. Parallel chunks only pay off when the provider has spare
+     * capacity to serve them at the same rate - a hosted API, for instance.
+     * A local model on one GPU does not: the requests queue behind the same
+     * hardware, so N parallel chunks each run N times slower and every one of
+     * them is more likely to cross the per-request timeout, which is how a
+     * whole document comes back with untranslated segments. Raise
+     * NYD_CONCURRENCY for hosted providers.
+     */
+    concurrency: envInt("NYD_CONCURRENCY", 1),
   },
 } as const;
 

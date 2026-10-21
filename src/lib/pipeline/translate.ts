@@ -287,6 +287,8 @@ export async function translateSegments(
   // slack does not reintroduce the drift the carry exists to prevent.
   const tails: string[] = new Array(chunks.length).fill("");
   const results: Array<Awaited<ReturnType<typeof translateChunkWithFallback>>> = [];
+  /** Segments whose chunk the provider gave up on - always worth asking again. */
+  const failedChunkSegments: Segment[] = [];
   let next = 0;
   let chainTail = "";
 
@@ -309,6 +311,7 @@ export async function translateSegments(
       results[i] = outcome;
       tails[i] = outcome.contextCarry;
       if (outcome.contextCarry) chainTail = outcome.contextCarry;
+      if (outcome.chunkFailed) failedChunkSegments.push(...chunk.segments);
 
       done += chunk.segments.length;
       opts.onProgress?.(done, toTranslate.length);
@@ -325,18 +328,45 @@ export async function translateSegments(
     for (const seg of outcome.segments) out.push(seg);
   }
 
-  // One bounded retry for segments the model returned empty. A local model
-  // occasionally drops a few ids inside a chunk; re-asking only for those is
-  // cheap and turns an omission into a translation. Bounded so a systemic
-  // failure (every segment empty) is not simply repeated at extra cost.
-  const emptyOut = out.filter((s) => !s.target);
-  if (emptyOut.length > 0 && emptyOut.length <= 40) {
+  // Two bounded retries, for two different failures.
+  //
+  // A chunk the provider gave up on (timeout, aborted prediction) is always
+  // asked again, in *half-size* chunks. The first version of this code re-asked
+  // in the same grouping, so a chunk the model could not answer in one go -
+  // reply cut short, request timed out mid-generation - failed the same way a
+  // second time, and 60 segments went untranslated on a real 23-page deed.
+  //
+  // Segments the model answered but left empty are a different failure: it
+  // dropped a few ids. Those are re-asked too, but only when the damage is
+  // localised - a document that came back mostly empty has failed for a reason
+  // that asking again will not fix, and repeating it just burns the budget.
+  const MAX_RETRY_CHUNKS = 8;
+  const retryBudget = Math.max(200, Math.floor(config.chunkTokenBudget / 2));
+  const retryMaxSegments = Math.max(1, Math.floor(config.chunkMaxSegments / 2));
+
+  const failedIndices = new Set(failedChunkSegments.map((s) => s.index));
+
+  for (const chunk of chunkSegments(failedChunkSegments, retryBudget, retryMaxSegments).slice(0, MAX_RETRY_CHUNKS)) {
+    const retry = await translateChunkWithFallback(llm, chunk, docContext, nameHints, termPlanText, "", opts, warnings);
+    if (retry.chunkFailed) continue;
+    calls += retry.calls;
+    ambiguous.push(...retry.ambiguousTerms);
+    for (const seg of retry.segments) {
+      if (!seg.target) continue;
+      const i = out.findIndex((o) => o.index === seg.index);
+      if (i >= 0) out[i] = seg;
+    }
+  }
+
+  const emptyOut = out.filter((s) => !s.target && !failedIndices.has(s.index));
+  const systemicFailure = emptyOut.length > toTranslate.length / 2;
+  if (emptyOut.length > 0 && !systemicFailure) {
     const srcByIndex = new Map(segments.map((s) => [s.index, s] as const));
     const toRetry = emptyOut
       .map((s) => srcByIndex.get(s.index))
       .filter((s): s is Segment => s !== undefined);
 
-    for (const chunk of chunkSegments(toRetry)) {
+    for (const chunk of chunkSegments(toRetry, retryBudget, retryMaxSegments).slice(0, MAX_RETRY_CHUNKS)) {
       const retry = await translateChunkWithFallback(llm, chunk, docContext, nameHints, termPlanText, "", opts, warnings);
       if (retry.chunkFailed) continue;
       calls += retry.calls;
