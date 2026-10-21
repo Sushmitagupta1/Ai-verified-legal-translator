@@ -25,8 +25,18 @@ export const config = {
   maxUploadBytes: envInt("NYD_MAX_UPLOAD_MB", 64) * 1024 * 1024,
   maxPages: envInt("NYD_MAX_PAGES", 400),
 
-  /** Target token budget per translation chunk (Gujarati source side). */
-  chunkTokenBudget: envInt("NYD_CHUNK_TOKENS", 1800),
+  /**
+   * Target token budget per translation chunk (Gujarati source side).
+   *
+   * 1400 is what a local model on an 8 GiB GPU actually manages. Measured on a
+   * 23-page sale deed, translated by gemma3:12b and judged by qwen2.5:14b:
+   * 1400-token chunks produced 155 findings and a 0.935 fidelity score in
+   * 32 minutes, while 1800-token chunks produced 240 findings and a 0.774
+   * score in 54 minutes. A bigger chunk asks for a longer reply, and the
+   * longer the reply the more the model drifts, the more it is re-read, and
+   * the more likely a single segment is dropped.
+   */
+  chunkTokenBudget: envInt("NYD_CHUNK_TOKENS", 1400),
   /**
    * Maximum segments per translation chunk.
    *
@@ -39,7 +49,7 @@ export const config = {
    * The cookie jars to a 4096-token context too: a Q4 14B on an 8 GiB GPU has
    * no room for a bigger num_ctx, so prompt + response must both fit 4096.
    */
-  chunkMaxSegments: envInt("NYD_CHUNK_MAX_SEGMENTS", 20),
+  chunkMaxSegments: envInt("NYD_CHUNK_MAX_SEGMENTS", 14),
 
   /**
    * Below this OCR word-confidence the pipeline refuses to treat extracted text as

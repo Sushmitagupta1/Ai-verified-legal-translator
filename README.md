@@ -177,8 +177,8 @@ be set. **No API key is required for Ollama.**
 | `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
 | `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; raise it for hosted providers, leave it at 1 for a local model on one GPU |
 | **Chunking** | | |
-| `NYD_CHUNK_TOKENS` | `1800` | Target tokens per translation chunk |
-| `NYD_CHUNK_MAX_SEGMENTS` | `20` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
+| `NYD_CHUNK_TOKENS` | `1400` | Target tokens per translation chunk; a local model on one GPU does better with a smaller chunk than the budget allows |
+| `NYD_CHUNK_MAX_SEGMENTS` | `14` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
 | `NYD_MAX_PAGES` | `400` | Page ceiling per document |
 | `NYD_MAX_UPLOAD_MB` | `64` | Upload size limit |
 | **Storage** | | |

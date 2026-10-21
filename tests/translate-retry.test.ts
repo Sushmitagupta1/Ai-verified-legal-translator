@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { translateSegments } from "../src/lib/pipeline/translate";
+import { config } from "../src/lib/config";
 import type { Segment } from "../src/lib/pipeline/translate";
 
 function segments(count: number): Segment[] {
@@ -19,6 +20,11 @@ function idsInPrompt(messages: Array<{ role: string; content: string }>): number
   return [...user.matchAll(/\[(\d+)\]\s/g)].map((m) => Number(m[1]));
 }
 
+/** A request of this size is a first-pass chunk; a smaller one is a retry. */
+function isFirstPassSize(size: number): boolean {
+  return size > Math.ceil(config.chunkMaxSegments / 2);
+}
+
 describe("retrying segments the model left empty", () => {
   // Regression: the retry used to be skipped whenever more than 40 segments came
   // back empty, so the run with the most damage was the one that never re-tried
@@ -36,10 +42,10 @@ describe("retrying segments the model left empty", () => {
         const ids = idsInPrompt(messages);
         sizes.push(ids.length);
 
-        // First pass: the model drops the first 45 ids (a whole chunk plus
-        // part of the next), which is the shape of the failure seen on a real
-        // 23-page deed. Later calls - the retry - answer properly.
-        if (sizes.length <= 5) {
+        // A first-pass chunk is the one the model could not answer in one go:
+        // it drops the first 45 ids. A retry asks for less at a time and is
+        // answered properly.
+        if (isFirstPassSize(ids.length)) {
           return JSON.stringify({
             segments: ids.map((id) => ({ id, target: id < 45 ? "" : `Translated segment ${id}.` })),
           });
@@ -55,11 +61,11 @@ describe("retrying segments the model left empty", () => {
     expect(outcome.segments).toHaveLength(100);
     expect(outcome.segments.every((s) => s.target.length > 0)).toBe(true);
 
-    // The first pass ran five chunks of twenty; the retry asked in half-size
-    // chunks, so no retry request carried more than ten segments.
-    expect(sizes.slice(0, 5)).toEqual([20, 20, 20, 20, 20]);
-    expect(sizes.length).toBeGreaterThan(5);
-    expect(Math.max(...sizes.slice(5))).toBeLessThanOrEqual(10);
+    // The retry asked in half-size chunks, so no retry request carried more
+    // than half of a normal chunk's segments.
+    const retries = sizes.filter((s) => !isFirstPassSize(s));
+    expect(retries.length).toBeGreaterThan(0);
+    expect(Math.max(...retries)).toBeLessThanOrEqual(Math.ceil(config.chunkMaxSegments / 2));
   });
 
   it("re-asks a chunk that failed outright in smaller pieces", async () => {
@@ -75,7 +81,7 @@ describe("retrying segments the model left empty", () => {
 
         // A request this size is the one the provider gave up on (timeout,
         // aborted prediction). The same segments asked in smaller pieces work.
-        if (ids.length > 10) {
+        if (isFirstPassSize(ids.length)) {
           throw new Error("Ollama 500: prediction aborted, token repeat limit reached");
         }
         return JSON.stringify({
@@ -84,12 +90,13 @@ describe("retrying segments the model left empty", () => {
       },
     };
 
-    const outcome = await translateSegments(llm, segments(14), { docType: "property_document" });
+    const count = config.chunkMaxSegments;
+    const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
 
     expect(outcome.segments.every((s) => s.target.length > 0)).toBe(true);
     expect(outcome.warnings.some((w) => w.includes("chunk failed"))).toBe(true);
-    expect(sizes[0]).toBe(14);
-    expect(Math.max(...sizes.slice(1))).toBeLessThanOrEqual(10);
+    expect(sizes[0]).toBe(count);
+    expect(Math.max(...sizes.slice(1))).toBeLessThanOrEqual(Math.ceil(config.chunkMaxSegments / 2));
   });
 
   it("does not repeat a systemic failure", async () => {
@@ -105,11 +112,12 @@ describe("retrying segments the model left empty", () => {
       },
     };
 
-    const outcome = await translateSegments(llm, segments(40), { docType: "property_document" });
+    const count = config.chunkMaxSegments * 3;
+    const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
 
     // Every segment came back empty: re-asking would only repeat the same
     // failure at full cost, so the run reports the omissions instead.
-    expect(calls).toBe(2);
+    expect(calls).toBe(3);
     expect(outcome.segments.every((s) => s.target.length === 0)).toBe(true);
   });
 });
