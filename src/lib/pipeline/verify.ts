@@ -630,47 +630,82 @@ export async function runJudge(
     };
   }
 
-  const prompt = buildJudgePrompt(input);
+  // Audit in batches, not one request for the whole document. A 23-page deed
+  // in a single prompt asks a 14B model for a very long generation on a GPU it
+  // does not fit; when that request hit the 600 s timeout the whole stage
+  // stalled for 25 minutes and then reported no semantic coverage at all.
+  // Small batches bound each failure to one batch and keep partial coverage.
+  const BLOCKS_PER_CALL = 8;
+  const JUDGE_TIMEOUT_MS = 150_000;
 
-  try {
-    const raw = await llm.complete(
-      [
-        { role: "system", content: VERIFIER_SYSTEM },
-        { role: "user", content: prompt },
-      ],
-      { json: true, signal: opts.signal, model: opts.model ?? (config.llm.judgeModel || undefined), temperature: 0 },
-    );
+  const segments: JudgeResult["segments"] = [];
+  const documentNotes: string[] = [];
+  let succeeded = 0;
+  let failed = 0;
 
-    const parsed = parseJson<{
-      segments?: Array<{ index?: number; faithful?: boolean; issues?: JudgeIssue[]; confidence?: number }>;
-      documentNotes?: string[];
-      documentFaithful?: boolean;
-    }>(raw);
-
-    const segments = (parsed.segments ?? []).map((s) => ({
-      index: s.index ?? -1,
-      faithful: Boolean(s.faithful),
-      issues: s.issues ?? [],
-      confidence: typeof s.confidence === "number" ? Math.min(1, Math.max(0, s.confidence)) : 0.6,
-    }));
-
-    return {
-      segments,
-      documentNotes: parsed.documentNotes ?? [],
-      documentFaithful: segments.every((s) => s.faithful),
-      available: true,
+  for (let start = 0; start < input.blockIds.length; start += BLOCKS_PER_CALL) {
+    const end = Math.min(input.blockIds.length, start + BLOCKS_PER_CALL);
+    const batch: VerifyInput = {
+      ...input,
+      sourceTexts: input.sourceTexts.slice(start, end),
+      blockIds: input.blockIds.slice(start, end),
+      pageNumbers: input.pageNumbers.slice(start, end),
     };
-  } catch (err) {
-    return {
-      segments: [],
-      documentNotes: [
-        `Semantic verification could not run: ${err instanceof Error ? err.message : "unknown error"}. ` +
-          "Deterministic checks completed, but meaning-level issues are not covered in this run.",
-      ],
-      documentFaithful: true,
-      available: false,
-    };
+
+    try {
+      const raw = await llm.complete(
+        [
+          { role: "system", content: VERIFIER_SYSTEM },
+          { role: "user", content: buildJudgePrompt(batch) },
+        ],
+        {
+          json: true,
+          signal: withTimeout(opts.signal, JUDGE_TIMEOUT_MS),
+          model: opts.model || config.llm.judgeModel || undefined,
+          temperature: 0,
+        },
+      );
+
+      const parsed = parseJson<{
+        segments?: Array<{ index?: number; faithful?: boolean; issues?: JudgeIssue[]; confidence?: number }>;
+        documentNotes?: string[];
+      }>(raw);
+
+      for (const s of parsed.segments ?? []) {
+        const local = s.index ?? -1;
+        segments.push({
+          index: local >= 0 && local < end - start ? local + start : local,
+          faithful: Boolean(s.faithful),
+          issues: s.issues ?? [],
+          confidence: typeof s.confidence === "number" ? Math.min(1, Math.max(0, s.confidence)) : 0.6,
+        });
+      }
+      documentNotes.push(...(parsed.documentNotes ?? []));
+      succeeded += 1;
+    } catch (err) {
+      failed += 1;
+      documentNotes.push(
+        `Semantic verification did not run for blocks ${start + 1}-${end}: ${
+          err instanceof Error ? err.message : "unknown error"
+        }. Deterministic checks still cover those blocks.`,
+      );
+    }
   }
+
+  return {
+    segments,
+    documentNotes,
+    documentFaithful: segments.every((s) => s.faithful),
+    // A judge that returns no verdicts judged nothing: that is not a pass. It
+    // used to score semantic 1.0 and quietly inflate the whole indicator.
+    available: succeeded > 0 && failed === 0 && segments.length > 0,
+  };
+}
+
+/** Caller cancellation plus a hard per-request budget. */
+function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const timeout = AbortSignal.timeout(ms);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 /**

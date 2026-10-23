@@ -248,7 +248,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
       docType: prepared.detection.type,
       meanOcrConfidence: prepared.meanOcrConfidence,
     },
-    { signal: opts.signal, judgeModel: config.llm.judgeModel },
+    { signal: opts.signal, judgeModel: config.llm.judgeModel || undefined },
   );
 
   warnings.push(...verification.warnings);

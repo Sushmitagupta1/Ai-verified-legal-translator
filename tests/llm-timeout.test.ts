@@ -56,13 +56,68 @@ describe("ollama request timeout", () => {
   });
 
   it("fails the call instead of hanging when the server never answers", async () => {
+    let requests = 0;
+    const count = () => {
+      requests += 1;
+    };
+    server.on("request", count);
+
     llm.baseUrl = servedUrl;
     llm.timeoutMs = 250;
 
     const started = Date.now();
     await expect(
       createOllama().complete([{ role: "user", content: "hi" }], { retries: 0 }),
-    ).rejects.toThrow(/attempts/);
+    ).rejects.toThrow(/aborted|timeout/i);
     expect(Date.now() - started).toBeLessThan(10_000);
+
+    server.off("request", count);
+  });
+
+  it("does not retry a timed-out request", async () => {
+    // Regression: a 600 s judge call was retried four times, so one stuck
+    // request added 25 minutes to a run and then reported no semantic coverage.
+    let requests = 0;
+    const count = () => {
+      requests += 1;
+    };
+    server.on("request", count);
+
+    llm.baseUrl = servedUrl;
+    llm.timeoutMs = 200;
+
+    await expect(
+      createOllama().complete([{ role: "user", content: "hi" }], { retries: 4 }),
+    ).rejects.toThrow(/aborted|timeout/i);
+
+    expect(requests).toBe(1);
+    server.off("request", count);
+  });
+
+  it("treats an empty model option as the client's model", async () => {
+    // Regression: the judge passes config.llm.judgeModel through, which is ""
+    // when NYD_JUDGE_MODEL is unset. Ollama answered model:"" with 400 "model is
+    // required", so the documented default (judge with the translator model)
+    // never worked.
+    const seen: string[] = [];
+    const responder = (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk;
+      });
+      req.on("end", () => {
+        seen.push(JSON.parse(body).model);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "{}" } }] }));
+      });
+    };
+    server.on("request", responder);
+
+    llm.baseUrl = servedUrl;
+    const text = await createOllama().complete([{ role: "user", content: "hi" }], { model: "" });
+
+    expect(text).toBe("{}");
+    expect(seen[0]).toBeTruthy();
+    server.off("request", responder);
   });
 });

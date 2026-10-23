@@ -23,7 +23,10 @@ export function createOllama(): LlmClient {
     available: true,
 
     async complete(messages: LlmMessage[], opts: LlmOptions = {}): Promise<string> {
-      const useModel = opts.model ?? model;
+      // An empty string is not a model name. Callers pass `config.llm.*` straight
+      // through, and "" must mean "use the client's model", not "send model: ''"
+      // - Ollama answers that with 400 "model is required".
+      const useModel = opts.model?.trim() || model;
       const maxRetries = opts.retries ?? config.llm.maxRetries;
       let lastErr: unknown;
 
@@ -62,6 +65,14 @@ export function createOllama(): LlmClient {
           return text;
         } catch (err) {
           lastErr = err;
+          // A timeout or a caller cancellation is not a transient failure: the
+          // same request will fail the same way. Retrying it burned 5 x 600 s
+          // on one judge call and added 25 minutes to a run that should have
+          // taken one. Give up on the first abort.
+          const aborted =
+            opts.signal?.aborted === true ||
+            (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError"));
+          if (aborted) throw new LlmError("Request aborted (timeout or cancelled)", false);
           const retryable = err instanceof LlmError ? err.retryable : true;
           if (!retryable || attempt === maxRetries) break;
           await sleep(backoff(attempt), opts.signal);
