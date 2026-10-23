@@ -121,3 +121,100 @@ describe("retrying segments the model left empty", () => {
     expect(outcome.segments.every((s) => s.target.length === 0)).toBe(true);
   });
 });
+
+describe("keeping Gujarati out of the English column", () => {
+  // The model translates the prose and then copies an OCR'd Gujarati run
+  // straight into the target - a stray digit, or the whole registration-receipt
+  // page. The report then reads half Gujarati. Nothing used to fix it.
+  const GUJARATI = /[\u0A80-\u0AFF]/;
+
+  it("re-asks a segment that came back half in Gujarati", async () => {
+    let corrections = 0;
+
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async (messages: Array<{ role: string; content: string }>) => {
+        const ids = idsInPrompt(messages);
+        const isFirstPass = isFirstPassSize(ids.length);
+        if (!isFirstPass) corrections += 1;
+
+        return JSON.stringify({
+          segments: ids.map((id) => ({
+            id,
+            target:
+              isFirstPass && id === 0
+                ? "Signature of the Purchaser: \u0bb5\u0bc7\u0b9a\u0a28\u0bbe\u0bb0\u0aa8\u0ac0 \u0ab8\u0ab9\u0ac0: \u0aa4\u0acd \u0ab0"
+                : `Translated segment ${id}.`,
+          })),
+        });
+      },
+    };
+
+    const count = config.chunkMaxSegments;
+    const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
+    const first = outcome.segments.find((s) => s.index === 0)!;
+
+    expect(corrections).toBeGreaterThan(0);
+    expect(GUJARATI.test(first.target)).toBe(false);
+    expect(first.target.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the English half when the correction pass does not improve", async () => {
+    // A segment can be half good English and half copied OCR noise. If the
+    // model cannot do better, the English that was already right must survive -
+    // the noise is stripped, not the whole segment.
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async (messages: Array<{ role: string; content: string }>) => {
+        const ids = idsInPrompt(messages);
+        return JSON.stringify({
+          segments: ids.map((id) => ({
+            id,
+            target:
+              id === 0
+                ? "Signature of the Purchaser: Signature of the Seller: \u0aa4\u0acd \u0ab0 \u0aa7\u0abf \u0aaa\u0acb \u0a9c\u0abe"
+                : `Translated segment ${id}.`,
+          })),
+        });
+      },
+    };
+
+    const count = config.chunkMaxSegments;
+    const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
+    const first = outcome.segments.find((s) => s.index === 0)!;
+
+    expect(GUJARATI.test(first.target)).toBe(false);
+    expect(first.target).toContain("Signature of the Purchaser");
+  });
+
+  it("never ships Gujarati even when the model keeps echoing it", async () => {
+    const llm = {
+      name: "fake",
+      model: "fake",
+      available: true,
+      complete: async (messages: Array<{ role: string; content: string }>) => {
+        const ids = idsInPrompt(messages);
+        return JSON.stringify({
+          segments: ids.map((id) => ({
+            id,
+            target:
+              id === 0
+                ? "\u0ab8\u0aac \u0ab0\u0a9c\u0ac0\u0ab8\u0acd\u0a9f\u0acd\u0ab0\u0abe\u0ab0 \u0aae\u0abe\u0a82\u0a97\u0ab0\u0acb\u0ab3 \u0a85\u0aa8\u0ac1.\u0aa8\u0a82\u0aac\u0ab0 \u0aaa\u0a95\u0acd\u0ab7\u0a95\u0abe\u0ab0\u0aa8\u0ac1\u0a82 \u0aa8\u0abe\u0aae"
+                : `Translated segment ${id}.`,
+          })),
+        });
+      },
+    };
+
+    const count = config.chunkMaxSegments;
+    const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
+    const first = outcome.segments.find((s) => s.index === 0)!;
+
+    expect(GUJARATI.test(first.target)).toBe(false);
+    expect(first.target.length).toBeGreaterThan(0);
+  });
+});

@@ -6,6 +6,7 @@ import {
   splitSentences,
 } from "../domain";
 import type { Block, BlockKind } from "../domain";
+import { indicRatio } from "../domain";
 import { buildDocContext } from "../llm/doctype-context";
 import { TRANSLATION_SYSTEM, buildUserPrompt } from "../llm/prompts";
 import { parseJson } from "../llm/provider";
@@ -375,6 +376,77 @@ export async function translateSegments(
         if (!seg.target) continue;
         const i = out.findIndex((o) => o.index === seg.index);
         if (i >= 0) out[i] = seg;
+      }
+    }
+  }
+
+  // The deliverable is an English document, so a target that still carries
+  // Gujarati script is a defect no matter how good the prose around it is. The
+  // local model does this on exactly the pages a human skims least: a stray
+  // "૧" copied from an OCR'd stamp, a whole registration-receipt paragraph
+  // echoed back untranslated. Structural checks report it, nothing fixed it.
+  //
+  // One correction pass, in small chunks (3 at a time - the model complies far
+  // more reliably when the batch is tiny), with an explicit instruction. Then a
+  // hard floor: anything still mixed is reduced to English plus an explicit
+  // illegibility marker, because shipping half-Gujarati silently is worse than
+  // saying "this passage could not be read".
+  const RESIDUE_LIMIT = 0.08;
+  // Only ask the model again where it plausibly lost whole words. A segment at
+  // 9-15% is a stray copied digit or letter inside otherwise good English; a
+  // retry costs a full generation and rarely improves it, so those go straight
+  // to the cheap strip below.
+  const RETRY_LIMIT = 0.15;
+  const residueOut = out.filter((s) => s.target && indicRatio(s.target) > RETRY_LIMIT);
+  if (residueOut.length > 0) {
+    const srcByIndex = new Map(segments.map((s) => [s.index, s] as const));
+    const toFix = residueOut
+      .map((s) => srcByIndex.get(s.index))
+      .filter((s): s is Segment => s !== undefined);
+
+    const fixContext =
+      `${docContext}\n\n## Correction pass\n` +
+      "The previous answer for these segments still contained Gujarati script. " +
+      "Return English only: transliterate Gujarati names and digits, write [illegible OCR] where the source is unreadable noise, and do not copy Gujarati characters.";
+
+    for (const chunk of chunkSegments(toFix, retryBudget, Math.min(3, retryMaxSegments)).slice(0, MAX_RETRY_CHUNKS)) {
+      const retry = await translateChunkWithFallback(llm, chunk, fixContext, nameHints, termPlanText, "", opts, warnings);
+      if (retry.chunkFailed) continue;
+      calls += retry.calls;
+      ambiguous.push(...retry.ambiguousTerms);
+      for (const seg of retry.segments) {
+        if (!seg.target) continue;
+        const i = out.findIndex((o) => o.index === seg.index);
+        if (i < 0) continue;
+        // Only take the retry if it is strictly cleaner. An equally mixed
+        // answer has usually dropped the English that was already right, so the
+        // old text - which still holds it - is the better base to strip.
+        if (indicRatio(seg.target) < indicRatio(out[i].target)) out[i] = seg;
+      }
+    }
+
+    for (const seg of out) {
+      const ratio = indicRatio(seg.target);
+      if (ratio === 0) continue;
+
+      const stripped = seg.target
+        .replace(/[\u0900-\u097F\u0A80-\u0AFF]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (ratio > 0.4 || (ratio > RESIDUE_LIMIT && stripped.length < 12)) {
+        seg.target = "[OCR illegible - verify this passage against the source page]";
+      } else if (stripped.length === 0) {
+        seg.target = "[OCR illegible - verify this passage against the source page]";
+      } else {
+        // A stray glyph inside good English - a leftover stamp character, a
+        // Gujarati digit the model forgot to convert - is noise, not content.
+        // Strip it silently; only call out the segments that lost real text.
+        seg.target = ratio > RESIDUE_LIMIT ? `${stripped} [illegible OCR removed]` : stripped;
+      }
+
+      if (ratio > RESIDUE_LIMIT) {
+        seg.notes = [...(seg.notes ?? []), "Residual Gujarati could not be translated; marked for review."];
       }
     }
   }

@@ -393,6 +393,18 @@ export function containsIndic(s: string): boolean {
   return /[ऀ-ॿঀ-৿਀-੿઀-૿]/.test(s);
 }
 
+/**
+ * Share of the non-space characters that are Devanagari/Gujarati script.
+ *
+ * Used as a post-translation guard: English output must not carry Gujarati
+ * runs, however good the surrounding prose looks.
+ */
+export function indicRatio(s: string): number {
+  const total = s.replace(/\s/g, "").length;
+  if (total === 0) return 0;
+  return ((s.match(/[઀-૿ऀ-ॿ]/g) ?? []).length) / total;
+}
+
 /** Word-ish tokenizer that keeps Indic combining marks attached to their base. */
 export function tokenize(s: string): string[] {
   const cleaned = cleanInvisible(s).toLowerCase();
