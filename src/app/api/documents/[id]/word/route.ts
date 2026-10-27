@@ -21,8 +21,10 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   );
   if (!document) return NextResponse.json({ error: "That file is not in the library." }, { status: 404 });
 
-  const report = loadReport(id);
-  if (!report) {
+  const blocks = loadBlocks(id);
+  // The Word file is the deliverable, not the audit. It becomes downloadable as
+  // soon as the translation is on disk; the report may still be running.
+  if (blocks.length === 0 || !blocks.some((b) => (b.targetText ?? "").trim())) {
     return NextResponse.json(
       { error: "The English file is not ready yet — wait for the translation to finish, then download again." },
       { status: 409 },
@@ -34,8 +36,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       {
         docId: id,
         fileName: document.file_name,
-        blocks: loadBlocks(id),
-        report,
+        blocks,
+        report: loadReport(id),
         companyName: document.company_name ?? "",
       },
       "docx",

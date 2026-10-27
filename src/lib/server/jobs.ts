@@ -106,7 +106,12 @@ function sweepOrphanedJobs(): void {
 
     const pid = readPid(row.payload);
     if (pid != null) {
-      if (processAlive(pid)) continue;
+      // A pid alone is not proof of life: the OS reuses numbers, and a
+      // restarted server can inherit the one a stale job recorded. A job
+      // created before this process started cannot be running inside it, so it
+      // is an orphan even if the number now belongs to us.
+      const inheritedOwnPid = pid === process.pid && row.created_at < PROCESS_STARTED_AT;
+      if (!inheritedOwnPid && processAlive(pid)) continue;
     } else if (row.created_at >= PROCESS_STARTED_AT) {
       // No pid recorded, but the row was created after this process booted —
       // it belongs to this one, so leave it alone.

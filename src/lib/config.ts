@@ -80,6 +80,30 @@ export const config = {
     timeoutMs: envInt("NYD_LLM_TIMEOUT_MS", 600_000),
     /** Judge pass runs at a different (usually stronger) model when configured. */
     judgeModel: process.env.NYD_JUDGE_MODEL ?? "",
+
+    /**
+     * Second-opinion model for the segments the fast first pass got wrong.
+     *
+     * A 7B model translates a 23-page deed in minutes instead of half an hour,
+     * but it drops receipt numbers and repeats stamp noise on exactly the pages
+     * that matter. Flagging those segments and re-asking a 12B model costs a few
+     * minutes instead of re-translating the whole document with the slow model.
+     *
+     * Empty means do not run the pass (the single-model behaviour).
+     */
+    repairModel: process.env.NYD_LLM_REPAIR_MODEL ?? "",
+    /**
+     * Wall-clock budget for the whole second-opinion pass.
+     *
+     * The pass must never turn a fast run back into a slow one. Six minutes is
+     * roughly four to six 12B calls on an 8 GiB GPU; whatever is still flagged
+     * after that is reported to the reviewer instead.
+     */
+    repairBudgetMs: envInt("NYD_LLM_REPAIR_BUDGET_MS", 360_000),
+    /** Hard cap on how many flagged segments are re-asked. */
+    repairMaxSegments: envInt("NYD_LLM_REPAIR_SEGMENTS", 48),
+    /** Segments per second-opinion request. */
+    repairBatchSegments: envInt("NYD_LLM_REPAIR_BATCH", 8),
   },
 
   ocr: {

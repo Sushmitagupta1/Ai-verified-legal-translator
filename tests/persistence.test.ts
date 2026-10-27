@@ -233,3 +233,38 @@ describe("currency survives segmentation", () => {
     expect(findings.filter((f) => f.check === "datum.currency_changed")).toHaveLength(1);
   });
 });
+
+describe("script detection at segmentation", () => {
+  const block = (id: string, ordinal: number, sourceText: string) => ({
+    id,
+    ordinal,
+    pageNumber: 1,
+    kind: "body" as const,
+    sourceText,
+    targetText: "",
+    translationState: "ai" as const,
+    tokenCount: 0,
+    meta: {},
+  });
+
+  it("sends Gujarati prose to the model, never through as English", () => {
+    // A mangled character class once made every Gujarati block look Latin, and
+    // 187 of 209 segments on a real deed were copied through untranslated.
+    const segments = buildSegments({
+      blocks: [block("b0", 0, "આ જમીનની માપણી સર્વે નંબર ૫૭૨ મુજબ કરવામાં આવી છે.")],
+    });
+    expect(segments).toHaveLength(1);
+    expect(segments[0].passthrough).toBeFalsy();
+  });
+
+  it("still carries a Latin letterhead through in a Gujarati document", () => {
+    const segments = buildSegments({
+      blocks: [
+        block("b0", 0, "આ જમીનની માપણી સર્વે નંબર ૫૭૨ મુજબ કરવામાં આવી છે."),
+        block("b1", 1, "IN-GJ640495298974 21-Oct-2023 IMPACC"),
+      ],
+    });
+    const letterhead = segments.find((s) => s.source.startsWith("IN-GJ"));
+    expect(letterhead?.passthrough).toBe(true);
+  });
+});

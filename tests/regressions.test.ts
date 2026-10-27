@@ -150,7 +150,7 @@ function emptyVerification(): VerificationResult {
     alignment: { pairs: [], method: "positional", unmatchedSource: [], unmatchedTarget: [], exact: true },
     coverage: { totalBlocks: 0, translatedBlocks: 0, emptyBlocks: [], stuntedBlocks: [], ratio: 0 },
     termPlan: [],
-    judge: { segments: [], documentNotes: [], documentFaithful: true, available: false },
+    judge: { segments: [], documentNotes: [], documentFaithful: true, available: false, complete: false, blocksJudged: 0, blocksTotal: 0 },
     warnings: [],
   };
 }

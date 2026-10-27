@@ -206,8 +206,15 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
       lockedSegments: locked,
       signal: opts.signal,
       onProgress: (done, total) => {
-        const pct = 35 + Math.round((done / Math.max(1, total)) * 35);
+        const pct = 35 + Math.round((done / Math.max(1, total)) * 33);
         opts.onProgress?.("translated", `Translated ${done}/${total} segments`, pct);
+      },
+      onRepair: (done, total) => {
+        // Stays below 70 even on the last flagged segment: 70 is only reported
+        // once the translation is on disk and the Word file can be downloaded.
+        // Reporting it here would let the UI save a 409 as a .docx.
+        const pct = 68 + (done >= total ? 1 : 0);
+        opts.onProgress?.("translated", `Double-checking ${done}/${total} flagged segments`, pct);
       },
     });
 
@@ -215,6 +222,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
     warnings.push(...outcome.warnings);
     setStage(opts.documentId, "translated", `Translated ${translated.length} segments`);
     persistTranslation(opts.documentId, prepared.blocks, translated);
+    opts.onProgress?.("translated", `Translated ${translated.length} segments`, 70);
   } else {
     translated = loadTranslation(opts.documentId);
     if (translated.length === 0) {
@@ -551,6 +559,7 @@ function blockingReasons(v: VerificationResult): string[] {
   if (v.score.criticalCount > 0) reasons.push(`${v.score.criticalCount} critical finding(s) open`);
   if (v.coverage.emptyBlocks.length > 0) reasons.push(`${v.coverage.emptyBlocks.length} block(s) without English`);
   if (!v.judge.available) reasons.push("semantic verification did not run");
+  else if (!v.judge.complete) reasons.push(`semantic verification covered ${v.judge.blocksJudged} of ${v.judge.blocksTotal} blocks`);
   return reasons;
 }
 
@@ -840,7 +849,7 @@ function emptyVerification(): VerificationResult {
     alignment: { pairs: [], method: "positional", unmatchedSource: [], unmatchedTarget: [], exact: true },
     coverage: { totalBlocks: 0, translatedBlocks: 0, emptyBlocks: [], stuntedBlocks: [], ratio: 0 },
     termPlan: [],
-    judge: { segments: [], documentNotes: [], documentFaithful: true, available: false },
+    judge: { segments: [], documentNotes: [], documentFaithful: true, available: false, complete: false, blocksJudged: 0, blocksTotal: 0 },
     warnings: [],
   };
 }

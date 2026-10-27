@@ -14,7 +14,12 @@ export interface ExportInput {
   docId: string;
   fileName: string;
   blocks: Block[];
-  report: VerificationReport;
+  /**
+   * The verification report. Null while a run is still verifying: the Word
+   * translation is finished and downloadable before the report exists, and the
+   * deliverable must not wait for the audit.
+   */
+  report: VerificationReport | null;
   /** Findings keyed by block id for inline annotation. */
   findingsByBlock?: Map<string, Finding[]>;
   /**
@@ -22,6 +27,14 @@ export interface ExportInput {
    * operator at upload or detected from the document; see `resolveCompanyName`.
    */
   companyName?: string;
+}
+
+/** Report-backed exports cannot be built before verification finishes. */
+function requireReport(input: ExportInput): VerificationReport {
+  if (!input.report) {
+    throw new Error("The verification report is not ready yet. Wait for the run to finish, then download again.");
+  }
+  return input.report;
 }
 
 /** Which document is being produced: the review report, the clean translation, or the Title Clearance Report. */
@@ -65,17 +78,18 @@ function indicatorLine(r: VerificationReport): string {
 }
 
 /** Closing block carried by every export: indicator, certification status, disclaimer. */
-function closingLines(r: VerificationReport): string[] {
-  return [
-    "=".repeat(78),
-    `Automated quality indicator : ${indicatorLine(r)}`,
-    "Certification status        : NOT CERTIFIED — human review required",
-    "",
-    DISCLAIMER,
-    "",
-    `Source SHA-256 : ${r.sourceSha256}`,
-    `Generated      : ${r.generatedAt}`,
-  ];
+function closingLines(r: VerificationReport | null): string[] {
+  const lines = ["=".repeat(78)];
+  if (r) {
+    lines.push(`Automated quality indicator : ${indicatorLine(r)}`);
+  } else {
+    lines.push("Automated quality indicator : not yet available (verification still running)");
+  }
+  lines.push("Certification status        : NOT CERTIFIED — human review required", "", DISCLAIMER);
+  if (r) {
+    lines.push("", `Source SHA-256 : ${r.sourceSha256}`, `Generated      : ${r.generatedAt}`);
+  }
+  return lines;
 }
 
 const DRAFT_NOTICE =
@@ -91,7 +105,8 @@ const SEVERITY_MARK: Record<string, string> = {
 // ── Plain text ───────────────────────────────────────────────────────────────
 
 export function buildTextExport(input: ExportInput): string {
-  const { blocks, report } = input;
+  const { blocks } = input;
+  const report = requireReport(input);
   const out: string[] = [];
 
   // Address the report the way the source document is addressed: its own
@@ -236,6 +251,7 @@ export function buildTranslationText(input: ExportInput): string {
  * the compromise, and it is stated in the export itself.
  */
 export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
+  const report = requireReport(input);
   const PDFDocument = (await import("pdfkit")).default;
   ensureDirs();
 
@@ -267,12 +283,12 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
 
   const meta: Array<[string, string]> = [
     ["Source file", input.fileName],
-    ["Document type", input.report.docTypeLabel],
-    ["Pages", String(input.report.pageCount)],
-    ["Translation segments", String(input.report.segmentCount)],
-    ["Translation provider", input.report.provider],
-    ["Source SHA-256", input.report.sourceSha256],
-    ["Report generated", input.report.generatedAt],
+    ["Document type", report.docTypeLabel],
+    ["Pages", String(report.pageCount)],
+    ["Translation segments", String(report.segmentCount)],
+    ["Translation provider", report.provider],
+    ["Source SHA-256", report.sourceSha256],
+    ["Report generated", report.generatedAt],
   ];
   for (const [k, v] of meta) {
     doc.font("Helvetica-Bold").fontSize(9).fillColor("#000").text(`${k}: `, { continued: true });
@@ -280,7 +296,7 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
   }
 
   doc.moveDown(0.6);
-  const ind = input.report.fidelityIndicator;
+  const ind = report.fidelityIndicator;
   doc
     .font("Helvetica-Bold")
     .fontSize(11)
@@ -295,16 +311,16 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
 
   doc.addPage();
   sectionTitle(doc, "AUTOMATED CHECKS PERFORMED");
-  for (const c of input.report.mechanicalChecks) {
+  for (const c of report.mechanicalChecks) {
     doc.font("Helvetica-Bold").fontSize(9).fillColor(c.passed ? "#166534" : "#991b1b").text(`${c.passed ? "PASS" : "FLAG"} — ${c.check} (${c.count})`);
     doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(c.description, { width: W - 10 });
     doc.moveDown(0.35);
   }
 
-  if (input.report.findings.length > 0) {
+  if (report.findings.length > 0) {
     doc.addPage();
-    sectionTitle(doc, `FINDINGS (${input.report.findings.length})`);
-    for (const f of input.report.findings) {
+    sectionTitle(doc, `FINDINGS (${report.findings.length})`);
+    for (const f of report.findings) {
       if (doc.y > doc.page.height - 150) doc.addPage();
       const color = f.severity === "critical" ? "#991b1b" : f.severity === "major" ? "#92400e" : "#444";
       doc.font("Helvetica-Bold").fontSize(9.5).fillColor(color).text(`${f.severity.toUpperCase()} — ${f.title}`);
@@ -433,20 +449,24 @@ export async function buildTranslationPdf(input: ExportInput): Promise<Buffer> {
     .stroke();
   doc.moveDown(0.5);
 
-  const ind = input.report.fidelityIndicator;
-  doc
-    .font("Helvetica-Bold")
-    .fontSize(10)
-    .fillColor(ind.grade === "green" ? "#166534" : ind.grade === "yellow" ? "#92400e" : "#991b1b")
-    .text(`Automated quality indicator: ${indicatorLine(input.report)} — NOT CERTIFIED`, { width: W });
-  doc.moveDown(0.25);
+  if (input.report) {
+    const ind = input.report.fidelityIndicator;
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(10)
+      .fillColor(ind.grade === "green" ? "#166534" : ind.grade === "yellow" ? "#92400e" : "#991b1b")
+      .text(`Automated quality indicator: ${indicatorLine(input.report)} — NOT CERTIFIED`, { width: W });
+    doc.moveDown(0.25);
+  }
   doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(DISCLAIMER, { width: W, align: "center" });
   doc.moveDown(0.25);
-  doc
-    .font("Helvetica")
-    .fontSize(8)
-    .fillColor("#555")
-    .text(`Source SHA-256: ${input.report.sourceSha256}   ·   Generated: ${input.report.generatedAt}`, { width: W });
+  if (input.report) {
+    doc
+      .font("Helvetica")
+      .fontSize(8)
+      .fillColor("#555")
+      .text(`Source SHA-256: ${input.report.sourceSha256}   ·   Generated: ${input.report.generatedAt}`, { width: W });
+  }
 
   const range = doc.bufferedPageRange();
   for (let i = 0; i < range.count; i++) {
@@ -511,12 +531,13 @@ function romanise(s: string): string {
 // ── DOCX ─────────────────────────────────────────────────────────────────────
 
 export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
+  const report = requireReport(input);
   const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, AlignmentType } =
     (await import("docx")) as typeof import("docx");
 
   ensureDirs();
 
-  const ind = input.report.fidelityIndicator;
+  const ind = report.fidelityIndicator;
   // A docx body is a flat list of block-level items, so headings/paragraphs
   // share the array with tables; `File` accepts either.
   const children: Array<InstanceType<typeof Paragraph> | InstanceType<typeof Table>> = [];
@@ -560,12 +581,12 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
 
   const rows: Array<[string, string]> = [
     ["Source file", input.fileName],
-    ["Document type", input.report.docTypeLabel],
-    ["Pages", String(input.report.pageCount)],
-    ["Translation segments", String(input.report.segmentCount)],
-    ["Translation provider", input.report.provider],
-    ["Source SHA-256", input.report.sourceSha256],
-    ["Report generated", input.report.generatedAt],
+    ["Document type", report.docTypeLabel],
+    ["Pages", String(report.pageCount)],
+    ["Translation segments", String(report.segmentCount)],
+    ["Translation provider", report.provider],
+    ["Source SHA-256", report.sourceSha256],
+    ["Report generated", report.generatedAt],
     ["Automated quality indicator", `${(ind.value * 100).toFixed(1)}% (${ind.grade.toUpperCase()}) — NOT CERTIFIED`],
   ];
 
@@ -589,7 +610,7 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
   );
 
   children.push(new Paragraph({ text: "Automated checks performed", heading: HeadingLevel.HEADING_2 }));
-  for (const c of input.report.mechanicalChecks) {
+  for (const c of report.mechanicalChecks) {
     children.push(
       new Paragraph({
         bullet: { level: 0 },
@@ -601,9 +622,9 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
     );
   }
 
-  if (input.report.findings.length > 0) {
-    children.push(new Paragraph({ text: `Findings (${input.report.findings.length})`, heading: HeadingLevel.HEADING_2 }));
-    for (const f of input.report.findings) {
+  if (report.findings.length > 0) {
+    children.push(new Paragraph({ text: `Findings (${report.findings.length})`, heading: HeadingLevel.HEADING_2 }));
+    for (const f of report.findings) {
       children.push(
         new Paragraph({
           children: [new TextRun({ text: `${f.severity.toUpperCase()} — ${f.title}`, bold: true })],
@@ -731,18 +752,42 @@ export async function buildTranslationDocx(input: ExportInput): Promise<Buffer> 
     }
   }
 
-  const ind = input.report.fidelityIndicator;
-  const band = ind.grade === "green" ? "166534" : ind.grade === "yellow" ? "92400E" : "991B1B";
-  children.push(
-    new Paragraph({
-      spacing: { before: 360 },
-      children: [new TextRun({ text: `Automated quality indicator: ${indicatorLine(input.report)} — NOT CERTIFIED`, bold: true, color: band })],
-    }),
-    new Paragraph({ children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
-    new Paragraph({
-      children: [new TextRun({ text: `Source SHA-256: ${input.report.sourceSha256}   ·   Generated: ${input.report.generatedAt}`, size: 15, color: "555555" })],
-    }),
-  );
+  const report = input.report;
+  if (report) {
+    const ind = report.fidelityIndicator;
+    const band = ind.grade === "green" ? "166534" : ind.grade === "yellow" ? "92400E" : "991B1B";
+    children.push(
+      new Paragraph({
+        spacing: { before: 360 },
+        children: [
+          new TextRun({ text: `Automated quality indicator: ${indicatorLine(report)} — NOT CERTIFIED`, bold: true, color: band }),
+        ],
+      }),
+      new Paragraph({ children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: `Source SHA-256: ${report.sourceSha256}   ·   Generated: ${report.generatedAt}`,
+            size: 15,
+            color: "555555",
+          }),
+        ],
+      }),
+    );
+  } else {
+    children.push(
+      new Paragraph({ spacing: { before: 360 }, children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: "Automated quality indicator: not yet available — verification is still running.",
+            size: 15,
+            color: "555555",
+          }),
+        ],
+      }),
+    );
+  }
 
   const doc = new Document({ sections: [{ properties: {}, children }] });
   return Packer.toBuffer(doc);
@@ -751,7 +796,7 @@ export async function buildTranslationDocx(input: ExportInput): Promise<Buffer> 
 // ── Title Clearance Report ───────────────────────────────────────────────────
 
 function tcrFooterOf(input: ExportInput): TcrFooter {
-  const r = input.report;
+  const r = requireReport(input);
   return {
     fidelity: indicatorLine(r),
     docTypeLabel: r.docTypeLabel,

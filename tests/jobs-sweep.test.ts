@@ -32,12 +32,17 @@ beforeAll(async () => {
   const rows: Array<[string, string]> = [
     // Owner is gone: must be failed.
     ["j-dead", JSON.stringify({ pid: DEAD_PID, stage: "translated", pct: 40 })],
-    // Owner is this very process: must be left running.
-    ["j-live", JSON.stringify({ pid: process.pid, stage: "translated", pct: 40 })],
+    // Owner is the parent dev-server process (pid != ours): left running.
+    ["j-live", JSON.stringify({ pid: process.ppid, stage: "translated", pct: 40 })],
+    // Recorded pid is ours, but the row predates this process: the OS reused
+    // the number after a restart, so the run is an orphan.
+    ["j-reused", JSON.stringify({ pid: process.pid, stage: "translated", pct: 40 })],
     // Legacy row with no pid, created before this process booted: failed.
     ["j-legacy", "{}"],
     // Legacy row with no pid, created just now: belongs here, leave it alone.
     ["j-fresh", "{}"],
+    // Started by this process after boot: running.
+    ["j-current", JSON.stringify({ pid: process.pid, stage: "extracted", pct: 5 })],
   ];
 
   const boot = new Date(Date.now() - 60_000).toISOString();
@@ -58,7 +63,7 @@ beforeAll(async () => {
       id,
       documentId,
       payload,
-      id === "j-fresh" ? now() : boot,
+      id === "j-fresh" || id === "j-current" ? now() : boot,
       boot,
     );
   }
@@ -86,6 +91,14 @@ describe("orphan sweep", () => {
     expect(db.get<{ status: string }>("SELECT status FROM documents WHERE id = ?", "d-j-live")?.status).toBe("running");
   });
 
+  it("fails a stale run whose pid was reused by this process", () => {
+    expect(jobStatus("j-reused")).toBe("failed");
+  });
+
+  it("leaves a run this process started after boot alone", () => {
+    expect(jobStatus("j-current")).toBe("running");
+  });
+
   it("fails a pid-less row that predates this process", () => {
     expect(jobStatus("j-legacy")).toBe("failed");
   });
@@ -95,7 +108,7 @@ describe("orphan sweep", () => {
   });
 
   it("reports running for a job it did not sweep", () => {
-    expect(jobs.isRunning("d-j-live")).toBe(true);
+    expect(jobs.isRunning("d-j-current")).toBe(true);
     expect(jobs.isRunning("d-j-dead")).toBe(false);
   });
 });

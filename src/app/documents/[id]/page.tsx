@@ -195,7 +195,11 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
     (s) => [s, data.findingsBySeverity[s] ?? 0] as const,
   ).filter(([, n]) => n > 0);
 
-  const finished = doc.status === "ready" || doc.status === "blocked" || doc.status === "failed";
+  const finished =
+    doc.status === "ready" ||
+    doc.status === "blocked" ||
+    doc.status === "translated" ||
+    doc.status === "failed";
   const neverRun = doc.status === "uploaded" && !data.job;
 
   const segments = showAllSegments ? data.segments : data.segments.slice(0, 25);
@@ -262,7 +266,7 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
           <div className="error">Pipeline failed: {data.job.error}</div>
         ) : null}
 
-        {finished && !running && doc.status !== "failed" ? (
+        {finished && doc.status !== "failed" && (!running || doc.status === "translated") ? (
           <div className="deliverables">
             <div className="row">
               <a className="btn big" href={`/api/documents/${id}/word`}>
@@ -273,7 +277,9 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
               </button>
             </div>
             <div className="small muted" style={{ marginTop: 6 }}>
-              The English translation, editable in Word.
+              {doc.status === "translated"
+                ? "The English translation is ready, editable in Word. Verification and the report are still finishing; this page updates itself."
+                : "The English translation, editable in Word."}
             </div>
             <details className="more">
               <summary>Other downloads: report, PDF and plain text</summary>

@@ -31,6 +31,8 @@ interface Item {
   detail: string;
   error?: string;
   downloaded?: boolean;
+  /** The Word file has been handed to the browser; checks may still be running. */
+  wordReady?: boolean;
 }
 
 const ACCEPT = [".pdf", ".docx", ".txt", ".md", ".html"];
@@ -149,6 +151,15 @@ export default function HomePage() {
       }
 
       const deadline = Date.now() + 3 * 60 * 60 * 1000;
+      let wordDownloaded = false;
+      const grabWord = () => {
+        if (wordDownloaded) return;
+        wordDownloaded = true;
+        patch(item.key, { wordReady: true, detail: "Word file ready — finishing quality checks" });
+        saveAs(`/api/documents/${id}/word`, `${item.file.name.replace(/\.[^.]+$/, "")}-english.docx`);
+        void loadRecent();
+      };
+
       for (;;) {
         await sleep(2000);
         if (Date.now() > deadline) throw new Error("This file is taking unusually long. Open it from the list below to see where it stopped.");
@@ -158,18 +169,30 @@ export default function HomePage() {
         const status: string = json.document?.status ?? "unknown";
         const job = json.job ?? {};
         const stage: string = job.stage ?? "";
+        const pct = Math.max(5, Math.min(99, Number(job.pct ?? 0)));
         patch(item.key, {
-          pct: Math.max(5, Math.min(99, Number(job.pct ?? 0))),
+          pct,
           detail: job.detail || STAGE_LABEL[stage] || "Working",
         });
 
+        // 70% is the point where the translation is committed to disk. The file
+        // is handed over there instead of at 100%, so the last ten minutes of
+        // verification and report writing do not hold the Word file hostage.
+        if (pct >= 70 || status === "translated") grabWord();
+
         if (status === "ready" || status === "blocked") {
+          grabWord();
           patch(item.key, { phase: "done", pct: 100, detail: "Word file ready", downloaded: true });
-          saveAs(`/api/documents/${id}/word`, `${item.file.name.replace(/\.[^.]+$/, "")}-english.docx`);
           void loadRecent();
           return;
         }
         if (status === "failed") {
+          // The file was already delivered; a failure in the audit that runs
+          // after it must not turn a usable translation into "Failed".
+          if (wordDownloaded) {
+            patch(item.key, { phase: "done", pct: 100, detail: "Word file ready — quality check stopped", downloaded: true });
+            return;
+          }
           throw new Error(job.error ?? json.document?.error ?? "The translation failed.");
         }
       }
@@ -255,6 +278,11 @@ export default function HomePage() {
                       Download Word
                     </a>
                   ) : null}
+                  {i.phase === "running" && i.wordReady && i.id ? (
+                    <a className="btn small-btn" href={`/api/documents/${i.id}/word`}>
+                      Download Word
+                    </a>
+                  ) : null}
                   {i.phase === "failed" ? (
                     <button
                       className="ghost small-btn"
@@ -267,8 +295,15 @@ export default function HomePage() {
                 </div>
                 {i.phase === "done" ? (
                   <div className="ok-line">
-                    Word file ready — the download should have started.{" "}
-                    {i.id ? <a href={`/api/documents/${i.id}/word`}>Download again</a> : null}
+                    {i.detail === "Word file ready"
+                      ? "Word file ready — the download should have started."
+                      : i.detail}
+                    {i.id ? (
+                      <>
+                        {" "}
+                        <a href={`/api/documents/${i.id}/word`}>Download again</a>
+                      </>
+                    ) : null}
                   </div>
                 ) : i.phase === "failed" ? (
                   <div className="error" style={{ marginTop: 8 }}>
@@ -276,6 +311,13 @@ export default function HomePage() {
                   </div>
                 ) : (
                   <>
+                    {i.wordReady && i.id ? (
+                      <div className="ok-line">
+                        Word file ready — the download should have started.{" "}
+                        <a href={`/api/documents/${i.id}/word`}>Download again</a>
+                        <span className="muted"> · {i.detail}</span>
+                      </div>
+                    ) : null}
                     <div className="progress" style={{ marginTop: 8 }}>
                       <div style={{ width: `${i.pct}%` }} />
                     </div>
@@ -304,7 +346,9 @@ export default function HomePage() {
           <table>
             <tbody>
               {showRecent.map((d) => {
-                const done = d.status === "ready" || d.status === "blocked";
+                // `translated` means the Word file is on disk while verification
+                // and the report are still running; it is already downloadable.
+                const done = d.status === "ready" || d.status === "blocked" || d.status === "translated";
                 return (
                   <tr key={d.id}>
                     <td>

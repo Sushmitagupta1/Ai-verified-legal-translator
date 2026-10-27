@@ -152,6 +152,29 @@ npx tsx scripts/probe-pipeline.ts
 `NYD_LLM_BASE_URL` defaults to `http://127.0.0.1:11434/v1` and does not need to
 be set. **No API key is required for Ollama.**
 
+### Fast first pass, second opinion only where it matters
+
+A 12B model on an 8 GiB GPU takes half an hour on a 23-page deed. A 7B model
+does the same document in a few minutes, but it drops receipt numbers, repeats
+one stamp line for several segments, and truncates the occasional clause —
+on exactly the pages a registrar reads most closely.
+
+So run the fast model first and re-ask the stronger model only about the
+segments that fail a cheap check (missing source numbers, Gujarati residue, an
+empty or far-too-short answer, or identical English for two different sources):
+
+```bash
+export NYD_LLM_MODEL=qwen2.5:7b          # first pass: fast
+export NYD_LLM_REPAIR_MODEL=gemma3:12b   # second opinion for flagged segments
+export NYD_JUDGE_MODEL=gemma3:12b        # audit and report
+```
+
+The second opinion runs after the translation is written, adopts an answer only
+when it removes a flag, and is bounded by a segment cap and a wall-clock budget.
+It also replaces the fast model's own pass over half-translated segments; if it
+stops early, that pass runs as a fallback. Leave `NYD_LLM_REPAIR_MODEL` empty to
+disable it and use a single model for everything.
+
 > Local models are honest about their trade-off: they are free and private, but
 > they produce more findings than a hosted model. Budget human review
 > accordingly.
@@ -175,6 +198,10 @@ be set. **No API key is required for Ollama.**
 | `NYD_LLM_RETRIES` | `4` | Retry attempts with exponential backoff |
 | `NYD_LLM_TIMEOUT_MS` | `600000` | Per-request timeout; must outlast one translation chunk on a local model |
 | `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
+| `NYD_LLM_REPAIR_MODEL` | *(empty — disabled)* | Stronger model that re-asks only the segments the first pass got wrong |
+| `NYD_LLM_REPAIR_SEGMENTS` | `48` | Hard cap on flagged segments re-asked per document |
+| `NYD_LLM_REPAIR_BATCH` | `8` | Flagged segments per second-opinion request |
+| `NYD_LLM_REPAIR_BUDGET_MS` | `360000` | Wall-clock budget for the whole second-opinion pass |
 | `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; raise it for hosted providers, leave it at 1 for a local model on one GPU |
 | **Chunking** | | |
 | `NYD_CHUNK_TOKENS` | `1400` | Target tokens per translation chunk; a local model on one GPU does better with a smaller chunk than the budget allows |
@@ -204,7 +231,9 @@ wants to audit a run, but nothing in the main flow asks for them.
 
 ```bash
 export NYD_LLM_PROVIDER=ollama
-export NYD_LLM_MODEL=gemma3:12b
+export NYD_LLM_MODEL=qwen2.5:7b
+export NYD_LLM_REPAIR_MODEL=gemma3:12b
+export NYD_JUDGE_MODEL=gemma3:12b
 npm run dev        # http://localhost:3100
 ```
 
@@ -220,9 +249,12 @@ npm run dev        # http://localhost:3100
 
 Jobs run outside the request: `POST .../run` returns `202` immediately, progress
 is written to the `jobs` table, and the page polls until the pipeline finishes.
-A 23-page deed takes about half an hour on a 12B model on an 8 GB GPU: one bar,
-then a Word file. A run produces one ordered target segment per source segment,
-so the segment list on the review page is the alignment, not a summary of it.
+The Word file is handed over as soon as the translation is committed to disk —
+verification and report writing continue afterwards in the same job, so the
+deliverable never waits for the audit. A 23-page deed takes about half an hour on
+a single 12B model; with a 7B first pass and a bounded second opinion it is a
+few minutes. A run produces one ordered target segment per source segment, so the
+segment list on the review page is the alignment, not a summary of it.
 
 ---
 

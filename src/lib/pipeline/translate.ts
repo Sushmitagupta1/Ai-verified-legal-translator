@@ -1,4 +1,4 @@
-﻿import { config } from "../config";
+import { config } from "../config";
 import {
   DISCLAIMER,
   estimateTokens,
@@ -9,7 +9,7 @@ import type { Block, BlockKind } from "../domain";
 import { indicRatio } from "../domain";
 import { buildDocContext } from "../llm/doctype-context";
 import { TRANSLATION_SYSTEM, buildUserPrompt } from "../llm/prompts";
-import { parseJson } from "../llm/provider";
+import { parseJson, requestSignal } from "../llm/provider";
 import type { LlmClient } from "../llm/provider";
 import { buildTermPlan, formatTermPlanForPrompt, findTerms, type TermOccurrence } from "../verify/terminology";
 
@@ -84,16 +84,13 @@ export interface SegmentInput {
  */
 export function buildSegments({ blocks, nameHints = [] }: SegmentInput): Segment[] {
   const segments: Segment[] = [];
-  const englishDoc = blocks.every((b) => !/[઀-૿]/.test(b.sourceText));
+  const englishDoc = blocks.every((b) => !/[\u0A80-\u0AFF]/.test(b.sourceText));
 
   for (const block of blocks) {
     if (NON_TRANSLATABLE.has(block.kind)) continue;
 
     const text = block.sourceText.trim();
     if (!text) continue;
-
-    const isLatin = !/[઀-૿ऀ-ॿ]/.test(text);
-    const passthrough = isLatin && (englishDoc || /[A-Za-z]{4,}/.test(text) && !/[઀-૿]/.test(text));
 
     const sentences = splitSentences(text);
     if (sentences.length === 0) {
@@ -116,7 +113,7 @@ function mkSegment(
   englishDoc: boolean,
   nameHints: string[],
 ): Segment {
-  const isLatin = !/[઀-૿ऀ-ॿ]/.test(text);
+  const isLatin = !/[\u0A80-\u0AFF\u0900-\u097F]/.test(text);
   // In a Gujarati document, a Latin run is usually a name, a citation, or an
   // abbreviation (FIR, IPC, Rs.). Those must survive verbatim, so they are
   // passthrough segments rather than transliteration candidates.
@@ -179,6 +176,17 @@ export function chunkSegments(
   return chunks;
 }
 
+export interface RepairOptions {
+  /** Second-opinion model. Empty disables the pass. */
+  model?: string;
+  maxSegments?: number;
+  budgetMs?: number;
+  batchSegments?: number;
+}
+
+/** Ceiling on one second-opinion request. See the call site for why. */
+const REPAIR_CALL_TIMEOUT_MS = 180_000;
+
 export interface TranslateOptions {
   docType: string;
   /** Type-detection confidence; low values make the model hedge in the prompt. */
@@ -190,8 +198,12 @@ export interface TranslateOptions {
   lockedSegments?: Map<number, string>;
   signal?: AbortSignal;
   onProgress?: (done: number, total: number) => void;
+  /** Progress for the second-opinion pass: segments checked so far, total flagged. */
+  onRepair?: (done: number, total: number) => void;
   /** Overrides config.llm.judgeModel / provider for this call. */
   model?: string;
+  /** Overrides the second-opinion defaults from config.llm. */
+  repair?: RepairOptions;
 }
 
 export interface TranslationOutcome extends TranslationResult {
@@ -397,7 +409,25 @@ export async function translateSegments(
   // retry costs a full generation and rarely improves it, so those go straight
   // to the cheap strip below.
   const RETRY_LIMIT = 0.15;
-  const residueOut = out.filter((s) => s.target && indicRatio(s.target) > RETRY_LIMIT);
+
+  // The first pass may be a fast model. Its failure modes are not the residue
+  // ones above: it drops receipt numbers, repeats one stamp line for several
+  // different segments, or truncates a clause. Those are cheap to detect and
+  // expensive to get wrong, so a stronger model gets a second look at exactly
+  // those segments - never the whole document, and never past a fixed budget.
+  // Running before the strip below matters: a segment the faster model left
+  // half in Gujarati is exactly one a stronger model can still rescue.
+  const repair = await repairSuspects(llm, out, docContext, nameHints, termPlanText, opts, warnings);
+  calls += repair.calls;
+
+  // Ask the fast model again only about mixed segments the second opinion did
+  // *not* answer - because no second opinion is configured, it stopped early
+  // (provider error, time budget), or the segment fell outside its cap. When the
+  // stronger model already answered a segment, re-asking the fast model first is
+  // wasted work: that repetition cost six minutes on a 23-page deed.
+  const residueOut = out.filter(
+    (s) => s.target && indicRatio(s.target) > RETRY_LIMIT && !repair.reasked.has(s.index),
+  );
   if (residueOut.length > 0) {
     const srcByIndex = new Map(segments.map((s) => [s.index, s] as const));
     const toFix = residueOut
@@ -424,30 +454,30 @@ export async function translateSegments(
         if (indicRatio(seg.target) < indicRatio(out[i].target)) out[i] = seg;
       }
     }
+  }
 
-    for (const seg of out) {
-      const ratio = indicRatio(seg.target);
-      if (ratio === 0) continue;
+  for (const seg of out) {
+    const ratio = indicRatio(seg.target);
+    if (ratio === 0) continue;
 
-      const stripped = seg.target
-        .replace(/[\u0900-\u097F\u0A80-\u0AFF]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+    const stripped = seg.target
+      .replace(/[\u0900-\u097F\u0A80-\u0AFF]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-      if (ratio > 0.4 || (ratio > RESIDUE_LIMIT && stripped.length < 12)) {
-        seg.target = "[OCR illegible - verify this passage against the source page]";
-      } else if (stripped.length === 0) {
-        seg.target = "[OCR illegible - verify this passage against the source page]";
-      } else {
-        // A stray glyph inside good English - a leftover stamp character, a
-        // Gujarati digit the model forgot to convert - is noise, not content.
-        // Strip it silently; only call out the segments that lost real text.
-        seg.target = ratio > RESIDUE_LIMIT ? `${stripped} [illegible OCR removed]` : stripped;
-      }
+    if (ratio > 0.4 || (ratio > RESIDUE_LIMIT && stripped.length < 12)) {
+      seg.target = "[OCR illegible - verify this passage against the source page]";
+    } else if (stripped.length === 0) {
+      seg.target = "[OCR illegible - verify this passage against the source page]";
+    } else {
+      // A stray glyph inside good English - a leftover stamp character, a
+      // Gujarati digit the model forgot to convert - is noise, not content.
+      // Strip it silently; only call out the segments that lost real text.
+      seg.target = ratio > RESIDUE_LIMIT ? `${stripped} [illegible OCR removed]` : stripped;
+    }
 
-      if (ratio > RESIDUE_LIMIT) {
-        seg.notes = [...(seg.notes ?? []), "Residual Gujarati could not be translated; marked for review."];
-      }
+    if (ratio > RESIDUE_LIMIT) {
+      seg.notes = [...(seg.notes ?? []), "Residual Gujarati could not be translated; marked for review."];
     }
   }
 
@@ -544,6 +574,352 @@ function entriesOf<T>(v: T[] | Record<string, T> | null | undefined): Array<[str
   return [];
 }
 
+interface RawChunkResponse {
+  segments?: Array<{
+    id?: number | string;
+    index?: number | string;
+    target?: string;
+    text?: string;
+    translation?: string;
+    confidence?: number;
+    notes?: string[];
+  }>;
+  ambiguousTerms?: ChunkResult["ambiguousTerms"];
+}
+
+/** Map every returned id to its target, accepting the schema variants a local model emits. */
+function targetsOf(parsed: RawChunkResponse | null): Map<number, { target: string; confidence?: number; notes?: string[] }> {
+  const byId = new Map<number, { target: string; confidence?: number; notes?: string[] }>();
+  for (const [key, s] of entriesOf(parsed?.segments)) {
+    const keyId = /^\d+$/.test(key) ? Number(key) : undefined;
+    const id = parseSegmentId(s.id ?? s.index ?? keyId);
+    if (id === null) continue;
+    byId.set(id, {
+      target: s.target ?? s.text ?? s.translation ?? "",
+      confidence: s.confidence,
+      notes: s.notes,
+    });
+  }
+  return byId;
+}
+
+// -- Second opinion -----------------------------------------------------------
+
+/** Gujarati and Devanagari digits are digits; comparisons normalise them to ASCII. */
+function toAsciiDigits(text: string): string {
+  return text.replace(/[\u0966-\u096F\u0AE6-\u0AEF]/g, (ch) => {
+    const code = ch.charCodeAt(0);
+    return String(code - (code >= 0x0ae6 ? 0x0ae6 : 0x0966));
+  });
+}
+
+function numericTokens(text: string): string[] {
+  return [...toAsciiDigits(text).matchAll(/\d[\d,]*(?:\.\d+)?/g)].map((m) => m[0]);
+}
+
+/**
+ * Numbers the target lost.
+ *
+ * Comparing digits without punctuation is what makes this usable on real
+ * registration receipts: the source says `18080.00`, the translation may say
+ * `Rs. 18,080`, and both carry the same digits. A model that replaced the
+ * receipt with repeated stamp noise carries none of them.
+ */
+export function lostNumbers(source: string, target: string): string[] {
+  const targetDigits = toAsciiDigits(target).replace(/\D/g, "");
+  const missing: string[] = [];
+  for (const token of numericTokens(source)) {
+    const all = token.replace(/[.,]/g, "");
+    if (all.length < 2) continue;
+    if (targetDigits.includes(all)) continue;
+    // A decimal part ("18080.00") may be written as the whole amount ("18,080").
+    const whole = token.split(".")[0].replace(/,/g, "");
+    if (whole.length >= 2 && targetDigits.includes(whole)) continue;
+    missing.push(token);
+  }
+  return [...new Set(missing)].slice(0, 4);
+}
+
+function targetKey(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+interface TargetFlag {
+  weight: number;
+  reason: string;
+}
+
+/**
+ * Function words that separate English prose from romanised Gujarati.
+ *
+ * A fast model sometimes transliterates a whole clause instead of translating
+ * it: the script is Latin, the residue check passes, and the result is not
+ * English ("Gama Pipedi Tambu, Taluka Junagadh ... Thi Prasthapit Thaay Chai").
+ * Prose in this register is dense in these words; a name/address list is not,
+ * which is why the length gate below matters.
+ */
+const ENGLISH_FUNCTION_WORDS = new Set([
+  "the", "of", "and", "to", "in", "is", "are", "was", "were", "has", "have", "had",
+  "shall", "will", "would", "that", "this", "these", "those", "for", "from", "with",
+  "by", "on", "at", "as", "or", "be", "been", "not", "any", "all", "which", "said",
+  "such", "under", "before", "after", "between", "into", "their", "his", "her", "its",
+  "it", "if", "than", "also", "who", "whom", "there", "when", "where", "a", "an",
+]);
+
+function looksTransliterated(text: string): boolean {
+  const words = text.toLowerCase().match(/[a-z]{2,}/g) ?? [];
+  // Addresses and name lists are legitimately Latin without English glue words;
+  // only a long stretch of prose with almost none is transliteration.
+  if (words.length < 12) return false;
+  const glue = words.filter((w) => ENGLISH_FUNCTION_WORDS.has(w)).length;
+  return glue / words.length < 0.08;
+}
+
+/**
+ * Numbers the English carries that the source does not.
+ *
+ * This is the other half of a fast model's number failure: it does not only drop
+ * the amount in front of it, it occasionally pulls one in from a neighbouring
+ * clause. A wrong amount is worse than a missing one, and the check is cheap.
+ */
+function foreignNumbers(source: string, target: string): string[] {
+  const clean = (list: string[]) => new Set(list.map((t) => t.replace(/[.,]/g, "")));
+  const sourceNumbers = clean(numericTokens(source));
+  const foreign = [...clean(numericTokens(target))].filter(
+    (n) => n.length >= 4 && !sourceNumbers.has(n),
+  );
+  return foreign.slice(0, 3);
+}
+
+/**
+ * Why a translated segment is not trustworthy enough to ship unchecked.
+ *
+ * The weights order the repair queue; they are not a quality score. Data that a
+ * registrar reads - amounts, dates, section numbers, party names - outranks
+ * shape and style, and an empty target outranks everything because there is
+ * nothing to read.
+ */
+export function assessTarget(
+  source: string,
+  target: string,
+  hasOtherSameText: (key: string) => boolean,
+): TargetFlag[] {
+  const flags: TargetFlag[] = [];
+  const text = target.trim();
+  const sourceLength = source.trim().length;
+
+  if (!text) {
+    flags.push({ weight: 8, reason: "the previous English was empty" });
+    return flags;
+  }
+  if (indicRatio(text) > 0) {
+    flags.push({ weight: 7, reason: "the previous English still contained Gujarati script" });
+  }
+  if (looksTransliterated(text)) {
+    flags.push({
+      weight: 7,
+      reason: "the previous English reads as transliterated Gujarati rather than a translation",
+    });
+  }
+  const foreign = foreignNumbers(source, text);
+  if (foreign.length > 0) {
+    flags.push({
+      weight: 6,
+      reason: `number(s) ${foreign.join(", ")} in the English are not in this source`,
+    });
+  }
+  const numbers = lostNumbers(source, text);
+  if (numbers.length > 0) {
+    flags.push({
+      weight: 6,
+      reason: `number(s) ${numbers.join(", ")} from the source are missing from the previous English`,
+    });
+  }
+  if (sourceLength >= 40 && text.length / Math.max(1, sourceLength) < 0.45) {
+    flags.push({ weight: 4, reason: "the previous English is far shorter than the source" });
+  }
+  const key = targetKey(text);
+  if (key.length >= 24 && key.split(" ").length >= 4 && hasOtherSameText(key)) {
+    flags.push({ weight: 2, reason: "the same English was also used for a different source segment" });
+  }
+  return flags;
+}
+
+function buildRepairPrompt(
+  batch: Array<{ seg: TranslatedSegment; flags: TargetFlag[] }>,
+  docContext: string,
+  nameHints: string[],
+  termPlanText: string,
+): string {
+  const items = batch.map(({ seg, flags }) => {
+    const numbers = lostNumbers(seg.source, seg.target);
+    return [
+      `[${seg.index}]`,
+      `Flagged because: ${flags.map((f) => f.reason).join("; ")}.`,
+      numbers.length > 0 ? `These numbers must appear in the English: ${numbers.join(", ")}.` : "",
+      `Source: ${seg.source}`,
+      `Previous English: ${seg.target.trim() || "(empty)"}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  });
+
+  return [
+    `## Document context\n${docContext}`,
+    "## Language pair\ngu-IN → en-IN (Indian legal register)",
+    nameHints.length > 0
+      ? `## Known entities in this document (use these exact spellings)\n${nameHints.join(", ")}`
+      : "",
+    `## Binding glossary for this segment\n${termPlanText}`,
+    "## Second-opinion pass\n" +
+      "Another engine translated these segments and the result has problems. Translate each source again from the Gujarati, " +
+      "correcting the flagged problem. Keep every name, number, date and amount exactly as the source has it. " +
+      "Do not copy Gujarati characters; transliterate a name rather than leave it in Gujarati script.\n\n" +
+      items.join("\n\n"),
+    '## Output\nJSON only: {"segments":[{"id":0,"target":"..."}]}. Every id above must appear exactly once.',
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function repairModelFor(opts: TranslateOptions): string {
+  return (opts.repair?.model ?? config.llm.repairModel ?? "").trim();
+}
+
+async function repairSuspects(
+  llm: LlmClient,
+  out: TranslatedSegment[],
+  docContext: string,
+  nameHints: string[],
+  termPlanText: string,
+  opts: TranslateOptions,
+  warnings: string[],
+): Promise<{ calls: number; corrected: number; flagged: number; reasked: Set<number> }> {
+  const repairModel = repairModelFor(opts);
+  if (!repairModel) return { calls: 0, corrected: 0, flagged: 0, reasked: new Set() };
+
+  const empty = out.filter((s) => !s.target.trim()).length;
+  // A document that came back mostly empty has failed systemically; a stronger
+  // model would repeat the same failure at greater cost.
+  if (empty > out.length / 2) return { calls: 0, corrected: 0, flagged: 0, reasked: new Set() };
+
+  const hasOtherSameText = (self: TranslatedSegment, key: string): boolean => {
+    if (!key) return false;
+    return out.some((s) => s !== self && targetKey(s.target) === key);
+  };
+
+  const suspects: Array<{ seg: TranslatedSegment; flags: TargetFlag[]; weight: number }> = [];
+  for (const seg of out) {
+    // `out` holds model output only: passthrough and human-locked segments are
+    // merged later. So every segment here was actually generated and can be
+    // worth a second look.
+    const flags = assessTarget(seg.source, seg.target, (key) => hasOtherSameText(seg, key));
+    if (flags.length === 0) continue;
+    suspects.push({ seg, flags, weight: flags.reduce((n, f) => n + f.weight, 0) });
+  }
+  if (suspects.length === 0) return { calls: 0, corrected: 0, flagged: 0, reasked: new Set() };
+
+  suspects.sort((a, b) => b.weight - a.weight || a.seg.index - b.seg.index);
+  const chosen = suspects.slice(0, Math.max(1, opts.repair?.maxSegments ?? config.llm.repairMaxSegments));
+  const batchSize = Math.max(1, opts.repair?.batchSegments ?? config.llm.repairBatchSegments);
+  const deadline = Date.now() + Math.max(0, opts.repair?.budgetMs ?? config.llm.repairBudgetMs);
+
+  let calls = 0;
+  let corrected = 0;
+  let done = 0;
+  let outOfTime = false;
+  /** Indices the stronger model actually answered a request for. */
+  const reasked = new Set<number>();
+
+  for (let i = 0; i < chosen.length; i += batchSize) {
+    const batch = chosen.slice(i, i + batchSize);
+    const remaining = deadline - Date.now();
+    if (remaining < 10_000) {
+      outOfTime = true;
+      break;
+    }
+
+    let raw: string;
+    try {
+      raw = await llm.complete(
+        [
+          { role: "system", content: TRANSLATION_SYSTEM },
+          { role: "user", content: buildRepairPrompt(batch, docContext, nameHints, termPlanText) },
+        ],
+        {
+          json: true,
+          model: repairModel,
+          // A local model occasionally degenerates into a repetition loop on a
+          // batch like this. Without a per-call ceiling, one such answer burned
+          // 353 s of a 360 s budget on a real deed and crowded out every other
+          // flagged segment. Typical calls finish in well under a minute.
+          signal: requestSignal(opts.signal, Math.min(remaining, REPAIR_CALL_TIMEOUT_MS)),
+          maxOutputTokens: Math.min(
+            2_048,
+            Math.max(768, batch.reduce((n, b) => n + estimateTokens(b.seg.source), 0) * 4),
+          ),
+        },
+      );
+      calls += 1;
+    } catch (err) {
+      const message = err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : "unknown error";
+      warnings.push(`Second-opinion pass stopped after ${done} segment(s): ${message}`);
+      break;
+    }
+
+    const returned = targetsOf(parseJson<RawChunkResponse>(raw));
+    // The prompt prints the real segment ids, but a local model sometimes
+    // renumbers the batch 0..n-1 - or 1..n - instead of echoing them. If every
+    // id it returned is one we asked about, match by id. Otherwise treat the
+    // answer as ordered and match by position: the numbers may be shifted, and
+    // matching a shifted id would put one segment's text in another's row.
+    const requested = new Set(batch.map((b) => b.seg.index));
+    const idsMatch = returned.size > 0 && [...returned.keys()].every((id) => requested.has(id));
+    const ordered = [...returned.values()];
+
+    for (let position = 0; position < batch.length; position += 1) {
+      const item = batch[position];
+      const entry = idsMatch ? returned.get(item.seg.index) : ordered[position];
+      const candidate = entry?.target?.trim() ?? "";
+      if (!candidate) continue;
+      // Only segments the stronger model actually answered are taken off the
+      // fast model's fallback queue below. An unparseable or short answer is
+      // not an answer, and a mixed segment still deserves the retry.
+      reasked.add(item.seg.index);
+
+      // Adopt only what actually clears a flag. A second opinion that merely
+      // rephrases good English is churn, and one that trades a lost number for
+      // repeated stamp noise is worse than the text it replaced.
+      const afterFlags = assessTarget(item.seg.source, candidate, (key) => hasOtherSameText(item.seg, key));
+      const after = afterFlags.reduce((n, f) => n + f.weight, 0);
+      if (after >= item.weight) continue;
+
+      item.seg.target = normalizeWhitespace(restoreClauseLabel(candidate, item.seg.source));
+      item.seg.notes = [...(item.seg.notes ?? []), "Second-opinion pass replaced this segment."];
+      corrected += 1;
+    }
+
+    if (!idsMatch && returned.size > 0) {
+      warnings.push(
+        `Second-opinion pass renumbered its answer; matched ${batch.length} flagged segment(s) by position.`,
+      );
+    }
+
+    done = Math.min(chosen.length, i + batch.length);
+    opts.onRepair?.(done, chosen.length);
+  }
+
+  if (corrected > 0) {
+    warnings.push(`Second-opinion pass replaced ${corrected} of ${chosen.length} flagged segment(s).`);
+  }
+  if (outOfTime) {
+    warnings.push(
+      `Second-opinion pass stopped at its time budget with ${chosen.length - done} flagged segment(s) left for review.`,
+    );
+  }
+  return { calls, corrected, flagged: chosen.length, reasked };
+}
+
 async function translateChunk(
   llm: LlmClient,
   chunk: Chunk,
@@ -568,31 +944,8 @@ async function translateChunk(
       { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.min(8_192, Math.max(4_096, chunk.tokens * 6)) },
   );
 
-  const parsed = parseJson<{
-    segments?: Array<{
-      id?: number | string;
-      index?: number | string;
-      target?: string;
-      text?: string;
-      translation?: string;
-      confidence?: number;
-      notes?: string[];
-    }>;
-    ambiguousTerms?: ChunkResult["ambiguousTerms"];
-  }>(raw);
-
-  const segmentList = entriesOf(parsed?.segments);
-  const byId = new Map<number, { target?: string; confidence?: number; notes?: string[] }>();
-  for (const [key, s] of segmentList) {
-    const keyId = /^\d+$/.test(key) ? Number(key) : undefined;
-    const id = parseSegmentId(s.id ?? s.index ?? keyId);
-    if (id === null) continue;
-    byId.set(id, {
-      target: s.target ?? s.text ?? s.translation ?? "",
-      confidence: s.confidence,
-      notes: s.notes,
-    });
-  }
+  const parsed = parseJson<RawChunkResponse>(raw);
+  const byId = targetsOf(parsed);
 
   if (process.env.NYD_DEBUG_TRANSLATION === "1") {
     const ids = chunk.segments.map((s) => s.index);

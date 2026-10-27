@@ -54,7 +54,13 @@ export interface JudgeResult {
   segments: JudgeSegment[];
   documentNotes: string[];
   documentFaithful: boolean;
+  /** At least one batch produced verdicts. */
   available: boolean;
+  /** Every batch produced verdicts; false means part of the document is unjudged. */
+  complete: boolean;
+  /** Blocks the judge returned verdicts for, and how many were sent to it. */
+  blocksJudged: number;
+  blocksTotal: number;
 }
 
 export interface ScoreBreakdown {
@@ -627,6 +633,9 @@ export async function runJudge(
       documentNotes: [],
       documentFaithful: true,
       available: false,
+      complete: false,
+      blocksJudged: 0,
+      blocksTotal: 0,
     };
   }
 
@@ -636,7 +645,10 @@ export async function runJudge(
   // stalled for 25 minutes and then reported no semantic coverage at all.
   // Small batches bound each failure to one batch and keep partial coverage.
   const BLOCKS_PER_CALL = 8;
-  const JUDGE_TIMEOUT_MS = 150_000;
+  // A 12B model on an 8 GiB GPU writes ~7.5 tokens/s, so eight blocks of legal
+  // prose can genuinely take longer than 150 s. That cap timed out one batch on
+  // a real deed and threw away the five that had answered.
+  const JUDGE_TIMEOUT_MS = 240_000;
 
   const segments: JudgeResult["segments"] = [];
   const documentNotes: string[] = [];
@@ -696,9 +708,14 @@ export async function runJudge(
     segments,
     documentNotes,
     documentFaithful: segments.every((s) => s.faithful),
-    // A judge that returns no verdicts judged nothing: that is not a pass. It
-    // used to score semantic 1.0 and quietly inflate the whole indicator.
-    available: succeeded > 0 && failed === 0 && segments.length > 0,
+    // A judge that returns no verdicts judged nothing: that is not a pass. But
+    // one failed batch must not discard the batches that did answer - on a real
+    // deed that turned 29 judged segments into "semantic review did not run".
+    // `complete` keeps the partial coverage visible instead of hiding it.
+    available: segments.length > 0,
+    complete: failed === 0 && succeeded > 0 && segments.length > 0,
+    blocksJudged: Math.min(segments.length, input.blockIds.length),
+    blocksTotal: input.blockIds.length,
   };
 }
 
@@ -806,10 +823,17 @@ export function scoreVerification(
   const coverage = opts.coverage.ratio;
 
   // No judge means no semantic signal. We must not report a high score for a
-  // check that never ran; the score is capped instead.
-  const semantic = opts.judge.available
+  // check that never ran; the score is capped instead. A judge that covered only
+  // part of the document (one batch timed out) is scored on the part it saw and
+  // the unjudged share is held at the same cap, so missing coverage can never
+  // raise the indicator.
+  const judged = opts.judge.available
+    ? Math.max(0, Math.min(1, opts.judge.blocksJudged / Math.max(1, opts.judge.blocksTotal)))
+    : 0;
+  const semanticBase = opts.judge.available
     ? Math.max(0, 1 - open.filter((f) => f.category === "Semantic fidelity").reduce((a, f) => a + weight(f.severity), 0) / Math.max(4, opts.judge.segments.length / 4))
     : 0.55;
+  const semantic = semanticBase * judged + 0.55 * (1 - judged);
 
   const ocrConfidence = opts.meanOcrConfidence ?? 0.9;
 
@@ -834,6 +858,7 @@ export function scoreVerification(
       opts.coverage.ratio === 1 &&
       opts.coverage.emptyBlocks.length === 0 &&
       opts.judge.available &&
+      opts.judge.complete &&
       opts.judge.documentFaithful,
   };
 }

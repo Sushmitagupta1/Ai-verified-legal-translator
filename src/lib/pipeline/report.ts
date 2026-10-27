@@ -152,10 +152,12 @@ export function buildReport(input: ReportInput, narrative: ReportNarrative): Ver
     {
       check: "Semantic faithfulness review",
       description: v.judge.available
-        ? "Compared each source segment with its English for meaning-level divergence: omission, addition, changed data, altered scope or modality, inverted negation, misidentified participant."
+        ? v.judge.complete
+          ? "Compared each source segment with its English for meaning-level divergence: omission, addition, changed data, altered scope or modality, inverted negation, misidentified participant."
+          : `Compared ${v.judge.blocksJudged} of ${v.judge.blocksTotal} source blocks with their English for meaning-level divergence. One or more audit batches did not run, so the remaining blocks are not covered by this check.`
         : "Not run. No language model was available for the meaning-level comparison, so negation, modality and scope changes are not covered by this report.",
       count: v.judge.segments.length,
-      passed: v.judge.available && v.judge.documentFaithful,
+      passed: v.judge.available && v.judge.complete && v.judge.documentFaithful,
     },
   ];
 
@@ -303,7 +305,13 @@ export async function generateNarrative(
           `Blocks: ${counts.blocks}\nTranslation segments: ${counts.segments}\n` +
           `Block coverage: ${(v.coverage.ratio * 100).toFixed(1)}%\n` +
           `Findings: ${counts.findings} (critical ${counts.critical}, major ${counts.major}, minor ${counts.minor})\n` +
-          `Semantic review: ${v.judge.available ? "ran" : "did not run"}\n` +
+          `Semantic review: ${
+            v.judge.available
+              ? v.judge.complete
+                ? "ran on all blocks"
+                : `partial — ${v.judge.blocksJudged} of ${v.judge.blocksTotal} blocks`
+              : "did not run"
+          }\n` +
           `Source OCR confidence: ${input.verification.warnings.some((w) => w.includes("OCR")) ? "see warnings" : "embedded text layer or high confidence"}`,
       }),
     },
