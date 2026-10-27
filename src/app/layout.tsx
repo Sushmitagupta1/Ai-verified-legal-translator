@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Nyayadoot — Gujarati to English legal translation",
   description:
-    "Upload a Gujarati legal document and get an English translation with a non-certified fidelity report.",
+    "Upload a Gujarati legal document and download the English translation as an editable Word file.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -17,7 +17,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               Nyaya<span>doot</span>
             </div>
             <div className="tagline">
-              Gujarati → English legal documents with a non-certified fidelity report
+              Gujarati → English legal documents — upload the file, download the Word file
             </div>
           </div>
           {children}

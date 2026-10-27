@@ -263,47 +263,44 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
         ) : null}
 
         {finished && !running && doc.status !== "failed" ? (
-          <div className="row" style={{ marginTop: 16 }}>
-            <button type="button" onClick={() => void startRun()} disabled={starting}>
-              {starting ? "Starting…" : "Re-run pipeline"}
-            </button>
-            <a className="btn ghost" href={`/api/documents/${id}/export/txt`}>
-              Report .txt
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/pdf`}>
-              Report .pdf
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/docx`}>
-              Report .docx
-            </a>
-          </div>
-        ) : null}
-
-        {finished && !running && doc.status !== "failed" ? (
-          <div className="row" style={{ marginTop: 8 }}>
-            <a className="btn ghost" href={`/api/documents/${id}/export/txt?kind=translation`}>
-              Translation .txt
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/pdf?kind=translation`}>
-              Translation .pdf
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/docx?kind=translation`}>
-              Translation .docx
-            </a>
-          </div>
-        ) : null}
-
-        {finished && !running && doc.status !== "failed" ? (
-          <div className="row" style={{ marginTop: 8 }}>
-            <a className="btn ghost" href={`/api/documents/${id}/export/txt?kind=tcr`}>
-              TCR .txt
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/pdf?kind=tcr`}>
-              TCR .pdf
-            </a>
-            <a className="btn ghost" href={`/api/documents/${id}/export/docx?kind=tcr`}>
-              TCR .docx
-            </a>
+          <div className="deliverables">
+            <div className="row">
+              <a className="btn big" href={`/api/documents/${id}/word`}>
+                Download Word file (.docx)
+              </a>
+              <button className="ghost" type="button" onClick={() => void startRun()} disabled={starting}>
+                {starting ? "Starting…" : "Translate again"}
+              </button>
+            </div>
+            <div className="small muted" style={{ marginTop: 6 }}>
+              The English translation, editable in Word.
+            </div>
+            <details className="more">
+              <summary>Other downloads: report, PDF and plain text</summary>
+              <div className="row" style={{ marginTop: 8 }}>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/docx`}>
+                  Report .docx
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/pdf`}>
+                  Report .pdf
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/txt`}>
+                  Report .txt
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/pdf?kind=translation`}>
+                  Translation .pdf
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/txt?kind=translation`}>
+                  Translation .txt
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/docx?kind=tcr`}>
+                  TCR .docx
+                </a>
+                <a className="btn ghost small-btn" href={`/api/documents/${id}/export/txt?kind=tcr`}>
+                  TCR .txt
+                </a>
+              </div>
+            </details>
           </div>
         ) : null}
       </div>

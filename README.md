@@ -145,7 +145,7 @@ export OLLAMA_CONTEXT_LENGTH=16384
 
 # run the pipeline
 export NYD_LLM_PROVIDER=ollama
-export NYD_LLM_MODEL=qwen2.5:14b
+export NYD_LLM_MODEL=gemma3:12b
 npx tsx scripts/probe-pipeline.ts
 ```
 
@@ -197,12 +197,14 @@ be set. **No API key is required for Ollama.**
 
 ## Web application
 
-The same pipeline behind a browser interface: upload a document, watch it run,
-review every segment and finding, and download the verification report.
+One step: drop a Gujarati PDF or Word file on the home page and download the
+English translation as an editable Word file. The report, the findings and the
+segment-by-segment review are still there behind the file name for anyone who
+wants to audit a run, but nothing in the main flow asks for them.
 
 ```bash
 export NYD_LLM_PROVIDER=ollama
-export NYD_LLM_MODEL=qwen2.5:14b
+export NYD_LLM_MODEL=gemma3:12b
 npm run dev        # http://localhost:3100
 ```
 
@@ -212,14 +214,15 @@ npm run dev        # http://localhost:3100
 | `GET /api/documents` | List documents |
 | `GET /api/documents/:id` | Document, job progress, report, segments and findings |
 | `POST /api/documents/:id/run` | Start or restart the pipeline |
-| `GET /api/documents/:id/export/:fmt` | Download the report as `txt`, `pdf` or `docx` |
+| `GET /api/documents/:id/word` | The deliverable: the English translation as an editable `.docx` |
+| `GET /api/documents/:id/export/:fmt` | Report, translation or TCR as `txt`, `pdf` or `docx` (`?kind=`) |
 | `GET /api/health` | Provider, model and OCR backend status |
 
 Jobs run outside the request: `POST .../run` returns `202` immediately, progress
-is written to the `jobs` table, and the review page polls until the pipeline
-finishes. A four-page document takes roughly ten minutes on a local 14B model.
-A run produces one ordered target segment per source segment, so the segment
-list on the review page is the alignment, not a summary of it.
+is written to the `jobs` table, and the page polls until the pipeline finishes.
+A 23-page deed takes about half an hour on a 12B model on an 8 GB GPU: one bar,
+then a Word file. A run produces one ordered target segment per source segment,
+so the segment list on the review page is the alignment, not a summary of it.
 
 ---
 

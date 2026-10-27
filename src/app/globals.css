@@ -105,6 +105,104 @@ h2 {
   max-width: 100%;
 }
 
+.dropzone.big {
+  padding: 44px 24px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dropzone.big:hover,
+.dropzone.big.drag {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.dropzone.big.busy {
+  cursor: default;
+}
+
+.dropzone-title {
+  font-size: 17px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.filelist {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.item {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 12px 14px;
+  background: #fbfcfd;
+}
+
+.item.done {
+  border-color: #bfe4ce;
+  background: #f2faf5;
+}
+
+.item.failed {
+  border-color: #eccaca;
+  background: #fdf6f6;
+}
+
+.item-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.item-name {
+  font-weight: 600;
+  flex: 1;
+  min-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ok-line {
+  margin-top: 8px;
+  font-size: 13.5px;
+  color: var(--ok);
+}
+
+.btn.small-btn,
+button.small-btn {
+  padding: 5px 11px;
+  font-size: 13px;
+}
+
+.btn.big {
+  padding: 12px 22px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.deliverables {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid #bfe4ce;
+  background: #f2faf5;
+  border-radius: 9px;
+}
+
+details.more {
+  margin-top: 10px;
+}
+
+details.more > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 13.5px;
+}
+
 .row {
   display: flex;
   gap: 12px;
