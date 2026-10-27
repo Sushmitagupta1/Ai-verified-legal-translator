@@ -70,6 +70,7 @@ describe("ollama request timeout", () => {
       createOllama().complete([{ role: "user", content: "hi" }], { retries: 0 }),
     ).rejects.toThrow(/aborted|timeout/i);
     expect(Date.now() - started).toBeLessThan(10_000);
+    expect(requests).toBe(1);
 
     server.off("request", count);
   });

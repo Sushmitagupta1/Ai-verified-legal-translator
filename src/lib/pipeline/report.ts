@@ -2,7 +2,7 @@
 import path from "node:path";
 import { config, ensureDirs } from "../config";
 import { buildReportPrompt, REPORT_SYSTEM } from "../llm/prompts";
-import { parseJsonLoose } from "../llm/provider";
+import { parseJsonLoose, requestSignal } from "../llm/provider";
 import type { LlmClient, LlmMessage } from "../llm/provider";
 import type { VerificationResult } from "./verify";
 
@@ -314,13 +314,21 @@ export async function generateNarrative(
     // prose, invent field names, or be cut off mid-object. One more attempt
     // costs a few minutes but keeps a real narrative in the report; after that
     // the fallback below carries the run instead of failing it.
+    //
+    // Both attempts are bounded: four short sections cannot need more than a
+    // couple of thousand tokens, and an unbounded generation is what turns
+    // "Generating report" into a 30-minute stall while the user waits for a
+    // Word file that is already translated and sitting on disk.
+    const NARRATIVE_TIMEOUT_MS = 180_000;
     let parsed: NarrativeFields | null = null;
     for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
       const raw = await llm.complete(messages, {
         json: true,
+        temperature: 0,
         // A truncated object cannot be parsed at all, so leave headroom for a
         // four-section narrative plus a long critical-findings list.
-        maxOutputTokens: 4_096,
+        maxOutputTokens: 1_200,
+        signal: requestSignal(undefined, NARRATIVE_TIMEOUT_MS),
       });
       parsed = parseJsonLoose<NarrativeFields>(raw);
     }
