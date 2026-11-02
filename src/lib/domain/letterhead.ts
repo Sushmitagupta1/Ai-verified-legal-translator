@@ -40,7 +40,9 @@ export interface ReportPattern {
 export type PatternVoice = "source" | "target";
 
 function pick(line: PatternLine, voice: PatternVoice): string {
-  return (voice === "target" ? line.target : line.source) || line.source;
+  // No source fallback in the English voice: a header line the translator could
+  // not render would otherwise drop Gujarati into the translated document.
+  return voice === "target" ? line.target : line.source;
 }
 
 const TITLE_HINT_EN =
@@ -263,7 +265,7 @@ export function patternParts(pattern: ReportPattern, company: string, voice: Pat
   const title = pattern.title ? pick(pattern.title, voice) : "";
   if (title) parts.push({ kind: "title", text: title });
   for (const line of buildAddressee(pattern, company, voice)) {
-    parts.push({ kind: "addressee", text: line });
+    if (line) parts.push({ kind: "addressee", text: line });
   }
   return parts;
 }

@@ -10,6 +10,19 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number.parseFloat(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
 export const config = {
   root: ROOT,
   dataDir: process.env.NYD_DATA_DIR ?? path.join(ROOT, "data"),
@@ -82,6 +95,38 @@ export const config = {
     judgeModel: process.env.NYD_JUDGE_MODEL ?? "",
 
     /**
+     * Fast screening judge.
+     *
+     * The semantic pass is the last thing between a translated document and a
+     * final report. Sending every block to a strong-but-slow model is what made
+     * a 23-page deed sit for twelve minutes after the Word file was ready. A
+     * small model screens every block first; only blocks it flags (or is unsure
+     * about) are escalated to `judgeModel`.
+     *
+     * Empty disables the screen and keeps the single-model behaviour.
+     */
+    judgeFastModel: process.env.NYD_JUDGE_FAST_MODEL ?? "",
+    /** Blocks per fast-screen request. Small models handle more blocks per call. */
+    judgeFastBlocksPerCall: envInt("NYD_JUDGE_FAST_BATCH", 12),
+    /** Blocks per strong-model request when escalating. */
+    judgeBlocksPerCall: envInt("NYD_JUDGE_BATCH", 8),
+    /**
+     * Escalate a block when the fast judge is less confident than this, even if
+     * it marked the block faithful. 0..1.
+     */
+    judgeEscalateBelow: envNumber("NYD_JUDGE_ESCALATE_BELOW", 0.86),
+    /**
+     * Wall-clock budget for the whole semantic pass, screen and escalation.
+     *
+     * The report must arrive in a useful time even if a batch is slow. Whatever
+     * is not judged inside this window is reported as partial coverage instead
+     * of holding the run open.
+     */
+    judgeBudgetMs: envInt("NYD_JUDGE_BUDGET_MS", 240_000),
+    /** Hard per-request cap for the fast screen and the strong judge. */
+    judgeTimeoutMs: envInt("NYD_JUDGE_TIMEOUT_MS", 180_000),
+
+    /**
      * Second-opinion model for the segments the fast first pass got wrong.
      *
      * A 7B model translates a 23-page deed in minutes instead of half an hour,
@@ -129,6 +174,28 @@ export const config = {
      * NYD_CONCURRENCY for hosted providers.
      */
     concurrency: envInt("NYD_CONCURRENCY", 1),
+    /**
+     * How many document jobs may run at once across the whole server.
+     *
+     * One local GPU cannot usefully translate two documents at the same time;
+     * the second job only makes the first slower and both more likely to time
+     * out. Additional uploads queue and start as the previous one finishes.
+     */
+    queueConcurrency: envInt("NYD_QUEUE_CONCURRENCY", 1),
+    /** Hard stop for a single pipeline run, so a stuck model cannot pin a queue slot forever. */
+    jobTimeoutMs: envInt("NYD_JOB_TIMEOUT_MS", 3 * 60 * 60 * 1000),
+  },
+
+  report: {
+    /**
+     * Write the report narrative with the language model.
+     *
+     * Off by default: the narrative is a summary of numbers the pipeline already
+     * computed, and asking a slow local model to phrase them added minutes to
+     * every run without changing a single finding. The deterministic narrative
+     * is written in milliseconds and says the same thing.
+     */
+    narrativeLlm: envFlag("NYD_REPORT_LLM", false),
   },
 } as const;
 

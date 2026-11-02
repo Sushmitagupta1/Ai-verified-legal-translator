@@ -41,6 +41,9 @@ pass, and every anomaly becomes an explicit finding rather than a silent error.
   accuracy claim.
 - **Human review before certification** — nothing is marked ready without the
   gate being passed.
+- **Report in minutes, not after the audit** — the Word file and a draft report
+  are written the moment the translation is committed; the meaning-level audit
+  runs behind a hard time budget and replaces the draft.
 - **Multi-format in and out** — PDF, DOCX and text in; TXT, PDF and DOCX out.
 - **Fully local deployment** — run entirely on-premise with Ollama. No case
   material ever leaves the machine.
@@ -50,8 +53,9 @@ pass, and every anomaly becomes an explicit finding rather than a silent error.
 ## How it works
 
 ```
-upload → extract/OCR → classify → segment → translate
-       → deterministic checks → semantic judge → review → report → export
+upload → extract/OCR → classify → segment → translate (word file + draft report)
+       → deterministic checks → fast semantic screen → escalate flagged blocks
+       → final report → export
 ```
 
 ### The core invariant
@@ -175,6 +179,35 @@ It also replaces the fast model's own pass over half-translated segments; if it
 stops early, that pass runs as a fallback. Leave `NYD_LLM_REPAIR_MODEL` empty to
 disable it and use a single model for everything.
 
+### A report that arrives with the file, not ten minutes later
+
+The Word file is the deliverable, so it is written as soon as the translation is
+committed. The report is written at the same point from the deterministic
+checks, marked `draft` / `pending`, and the document page shows it immediately.
+The meaning-level audit then runs and replaces the draft with the final report.
+
+That audit is two-tier:
+
+1. A small model (`NYD_JUDGE_FAST_MODEL`, e.g. `qwen2.5:7b`) screens every block.
+2. Only blocks it marks unfaithful, is unsure about (below
+   `NYD_JUDGE_ESCALATE_BELOW`), or failed to answer are re-asked of the strong
+   judge (`NYD_JUDGE_MODEL`, e.g. `gemma3:12b`).
+
+The whole pass is bounded by `NYD_JUDGE_BUDGET_MS` (4 minutes by default). Any
+block not judged inside that window is reported as partial coverage rather than
+holding the report open — the report says exactly what was and was not checked.
+Blocks with a critical deterministic finding, or a major finding in a category
+that changes legal meaning (amounts, dates, legal references, names, coverage),
+always go to the strong judge and are reviewed first. The fast screen is useful,
+but it cleared a page-6 sale-price contradiction on the 23-page benchmark; the
+deterministic evidence is what made the strong judge look at it.
+If `NYD_JUDGE_FAST_MODEL` is empty, every block goes to the strong judge, which
+preserves the old single-model behaviour.
+
+The report narrative is assembled from counts the pipeline already has. It is
+written in milliseconds and says the same thing a model would; set
+`NYD_REPORT_LLM=1` to have a model phrase it instead (at a cost of minutes).
+
 > Local models are honest about their trade-off: they are free and private, but
 > they produce more findings than a hosted model. Budget human review
 > accordingly.
@@ -202,6 +235,15 @@ disable it and use a single model for everything.
 | `NYD_LLM_REPAIR_SEGMENTS` | `48` | Hard cap on flagged segments re-asked per document |
 | `NYD_LLM_REPAIR_BATCH` | `8` | Flagged segments per second-opinion request |
 | `NYD_LLM_REPAIR_BUDGET_MS` | `360000` | Wall-clock budget for the whole second-opinion pass |
+| `NYD_JUDGE_FAST_MODEL` | *(empty)* | Small model that screens every block before the strong judge; leave empty for single-model judging |
+| `NYD_JUDGE_FAST_BATCH` | `12` | Blocks per fast-screen request |
+| `NYD_JUDGE_BATCH` | `8` | Blocks per strong-judge request when escalating |
+| `NYD_JUDGE_ESCALATE_BELOW` | `0.86` | Escalate a block when the fast judge's confidence is below this |
+| `NYD_JUDGE_BUDGET_MS` | `240000` | Wall-clock budget for the whole semantic pass; unjudged blocks are reported as partial coverage |
+| `NYD_JUDGE_TIMEOUT_MS` | `180000` | Per-request cap for one judge call |
+| `NYD_REPORT_LLM` | `0` | Set to `1` to write the report narrative with a model instead of deterministically |
+| `NYD_QUEUE_CONCURRENCY` | `1` | Document jobs allowed to run at once; extra uploads wait in a visible queue |
+| `NYD_JOB_TIMEOUT_MS` | `10800000` | Hard stop for a single run so a stuck model cannot pin a queue slot |
 | `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; raise it for hosted providers, leave it at 1 for a local model on one GPU |
 | **Chunking** | | |
 | `NYD_CHUNK_TOKENS` | `1400` | Target tokens per translation chunk; a local model on one GPU does better with a smaller chunk than the budget allows |
@@ -234,6 +276,7 @@ export NYD_LLM_PROVIDER=ollama
 export NYD_LLM_MODEL=qwen2.5:7b
 export NYD_LLM_REPAIR_MODEL=gemma3:12b
 export NYD_JUDGE_MODEL=gemma3:12b
+export NYD_JUDGE_FAST_MODEL=qwen2.5:7b
 npm run dev        # http://localhost:3100
 ```
 
@@ -241,20 +284,29 @@ npm run dev        # http://localhost:3100
 |---|---|
 | `POST /api/documents` | Upload — multipart `file`, optional `type` to override detection |
 | `GET /api/documents` | List documents |
-| `GET /api/documents/:id` | Document, job progress, report, segments and findings |
+| `GET /api/documents/:id` | Document, job progress, report, timings, queue position, segments and findings |
 | `POST /api/documents/:id/run` | Start or restart the pipeline |
+| `POST /api/documents/:id/cancel` | Cancel a queued or running job; anything already written is kept |
+| `GET /api/documents/:id/timings` | Stage-by-stage durations for the run |
 | `GET /api/documents/:id/word` | The deliverable: the English translation as an editable `.docx` |
 | `GET /api/documents/:id/export/:fmt` | Report, translation or TCR as `txt`, `pdf` or `docx` (`?kind=`) |
-| `GET /api/health` | Provider, model and OCR backend status |
+| `GET /api/health` | Provider, judge/repair models, narrative mode, queue depth and OCR backend |
 
 Jobs run outside the request: `POST .../run` returns `202` immediately, progress
 is written to the `jobs` table, and the page polls until the pipeline finishes.
 The Word file is handed over as soon as the translation is committed to disk —
-verification and report writing continue afterwards in the same job, so the
-deliverable never waits for the audit. A 23-page deed takes about half an hour on
-a single 12B model; with a 7B first pass and a bounded second opinion it is a
-few minutes. A run produces one ordered target segment per source segment, so the
-segment list on the review page is the alignment, not a summary of it.
+a draft report is written at the same moment, and the final report follows the
+bounded semantic pass. The deliverable never waits for the audit. On the 23-page
+benchmark (209 source segments, one 12B GPU) the Word file and draft report
+arrived together at about 16 minutes, and the final report followed 4 minutes
+later; the audit stops at its budget and reports what it covered. A run produces
+one ordered target segment per source segment, so the segment list on the review
+page is the alignment, not a summary of it.
+
+Uploads beyond the first wait in an in-process queue with a visible position, so
+two people do not halve each other's GPU throughput. The document page shows each
+stage's duration, the report's `draft`/`final` state and what the meaning-level
+audit actually covered.
 
 ---
 

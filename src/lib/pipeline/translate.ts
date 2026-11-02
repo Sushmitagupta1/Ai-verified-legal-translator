@@ -9,7 +9,7 @@ import type { Block, BlockKind } from "../domain";
 import { indicRatio } from "../domain";
 import { buildDocContext } from "../llm/doctype-context";
 import { TRANSLATION_SYSTEM, buildUserPrompt } from "../llm/prompts";
-import { parseJson, requestSignal } from "../llm/provider";
+import { parseJson, requestSignal, LlmError } from "../llm/provider";
 import type { LlmClient } from "../llm/provider";
 import { buildTermPlan, formatTermPlanForPrompt, findTerms, type TermOccurrence } from "../verify/terminology";
 
@@ -343,25 +343,51 @@ export async function translateSegments(
 
   // Two bounded retries, for two different failures.
   //
-  // A chunk the provider gave up on (timeout, aborted prediction) is always
-  // asked again, in *half-size* chunks. The first version of this code re-asked
-  // in the same grouping, so a chunk the model could not answer in one go -
-  // reply cut short, request timed out mid-generation - failed the same way a
-  // second time, and 60 segments went untranslated on a real 23-page deed.
+  // A chunk the provider gave up on (timeout, aborted prediction, off-schema
+  // reply that matched none of the ids) is always asked again, in *half-size*
+  // chunks. The first version of this code re-asked in the same grouping, so a
+  // chunk the model could not answer in one go - reply cut short, request timed
+  // out mid-generation - failed the same way a second time, and 60 segments went
+  // untranslated on a real 23-page deed.
   //
   // Segments the model answered but left empty are a different failure: it
   // dropped a few ids. Those are re-asked too, but only when the damage is
   // localised - a document that came back mostly empty has failed for a reason
   // that asking again will not fix, and repeating it just burns the budget.
+  //
+  // The cap scales with the damage: one failed chunk needs one or two retries,
+  // but a first pass that failed wholesale needs the whole document re-asked in
+  // small pieces. Silence is worse than a slower run.
   const MAX_RETRY_CHUNKS = 8;
+  const MAX_RETRY_CHUNKS_AFTER_FAILURE = 32;
   const retryBudget = Math.max(200, Math.floor(config.chunkTokenBudget / 2));
   const retryMaxSegments = Math.max(1, Math.floor(config.chunkMaxSegments / 2));
+  const retryChunksFor = (segments: number, cap: number) =>
+    Math.min(cap, Math.max(MAX_RETRY_CHUNKS, Math.ceil(segments / retryMaxSegments)));
 
   const failedIndices = new Set(failedChunkSegments.map((s) => s.index));
 
-  for (const chunk of chunkSegments(failedChunkSegments, retryBudget, retryMaxSegments).slice(0, MAX_RETRY_CHUNKS)) {
+  let consecutiveRetryFailures = 0;
+  for (const chunk of chunkSegments(failedChunkSegments, retryBudget, retryMaxSegments).slice(
+    0,
+    retryChunksFor(failedChunkSegments.length, MAX_RETRY_CHUNKS_AFTER_FAILURE),
+  )) {
     const retry = await translateChunkWithFallback(llm, chunk, docContext, nameHints, termPlanText, "", opts, warnings);
-    if (retry.chunkFailed) continue;
+    if (retry.chunkFailed) {
+      consecutiveRetryFailures += 1;
+      // Two retries in a row that produced nothing at all is the provider
+      // failing, not the chunk size. Stop rather than re-asking the whole
+      // document at 500 s per timeout.
+      if (consecutiveRetryFailures >= 2) {
+        warnings.push(
+          "Translation retries stopped after two consecutive provider failures with no usable output. " +
+            "The affected segments are marked as omissions.",
+        );
+        break;
+      }
+      continue;
+    }
+    consecutiveRetryFailures = 0;
     calls += retry.calls;
     ambiguous.push(...retry.ambiguousTerms);
     for (const seg of retry.segments) {
@@ -941,11 +967,35 @@ async function translateChunk(
       { role: "system", content: TRANSLATION_SYSTEM },
       { role: "user", content: user },
     ],
-      { json: true, signal: opts.signal, model: opts.model, maxOutputTokens: Math.min(8_192, Math.max(4_096, chunk.tokens * 6)) },
+    {
+      json: true,
+      signal: opts.signal,
+      model: opts.model,
+      // The reply is the translation plus JSON boilerplate. Asking for the
+      // client's 8k default on a 1,400-token source chunk exceeds a local
+      // model's 8k context, and the answer is then cut off mid-JSON — which
+      // parses to nothing and used to be committed as 14 empty segments.
+      maxOutputTokens: Math.min(4_096, Math.max(2_048, chunk.tokens * 2 + chunk.segments.length * 60)),
+    },
   );
 
   const parsed = parseJson<RawChunkResponse>(raw);
   const byId = targetsOf(parsed);
+
+  // A reply that parses but carries almost none of the ids we sent is an
+  // off-schema answer, not "these segments have no translation". Treating it
+  // as success is how a 23-page deed once came back with 178 empty segments
+  // and no warning. Throwing routes the chunk into the split-and-retry path.
+  const expected = chunk.segments.filter((s) => !s.passthrough).length;
+  const answered = chunk.segments.filter(
+    (s) => !s.passthrough && (byId.get(s.index)?.target ?? "").trim().length > 0,
+  ).length;
+  if (expected > 0 && answered * 2 < expected) {
+    throw new LlmError(
+      `Provider answered ${answered} of ${expected} segment(s); reply was ${raw.length} characters and did not match the ids sent`,
+      true,
+    );
+  }
 
   if (process.env.NYD_DEBUG_TRANSLATION === "1") {
     const ids = chunk.segments.map((s) => s.index);

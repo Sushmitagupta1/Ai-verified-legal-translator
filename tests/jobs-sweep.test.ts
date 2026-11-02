@@ -10,8 +10,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * child process, the child boots after the parent, and an age-based sweep then
  * decides a run started by the parent is "older than me" and fails it while it
  * is still translating. Ownership is the pid recorded on the row, not its age,
- * so these tests seed rows first and let the module's import-time sweep read
- * them back.
+ * so these tests seed rows first and let the module's lazy sweep read them back
+ * on the first job lookup.
  */
 let dataDir: string;
 let db: typeof import("../src/lib/db");
@@ -69,6 +69,9 @@ beforeAll(async () => {
   }
 
   jobs = await import("../src/lib/server/jobs");
+  // The sweep is lazy: importing the module no longer touches the database, so
+  // the first real job lookup is what performs the recovery.
+  jobs.isRunning("d-j-current");
 });
 
 afterAll(() => {

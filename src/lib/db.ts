@@ -199,6 +199,19 @@ CREATE TABLE IF NOT EXISTS activity (
   created_at  TEXT NOT NULL
 );
 
+-- One row per pipeline stage transition. The UI uses these to show where the
+-- time actually went, which is impossible to reconstruct from a progress bar.
+CREATE TABLE IF NOT EXISTS stage_timings (
+  id          TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  job_id      TEXT,
+  stage       TEXT NOT NULL,
+  detail      TEXT NOT NULL DEFAULT '',
+  started_at  TEXT NOT NULL,
+  ended_at    TEXT,
+  duration_ms INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
@@ -210,6 +223,11 @@ CREATE INDEX IF NOT EXISTS idx_datums_doc   ON datums(document_id, kind);
 CREATE INDEX IF NOT EXISTS idx_findings_doc ON findings(document_id, severity);
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_pages_doc    ON pages(document_id, page_number);
+CREATE INDEX IF NOT EXISTS idx_segments_doc ON segments(document_id, idx);
+CREATE INDEX IF NOT EXISTS idx_jobs_doc     ON jobs(document_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_doc ON activity(document_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_verif_doc    ON verification_runs(document_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_timings_doc  ON stage_timings(document_id, started_at);
 `;
 
 export function db(): DatabaseSync {

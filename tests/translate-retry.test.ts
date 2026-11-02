@@ -99,7 +99,7 @@ describe("retrying segments the model left empty", () => {
     expect(Math.max(...sizes.slice(1))).toBeLessThanOrEqual(Math.ceil(config.chunkMaxSegments / 2));
   });
 
-  it("does not repeat a systemic failure", async () => {
+  it("stops retrying after the provider fails twice in a row", async () => {
     let calls = 0;
 
     const llm = {
@@ -115,10 +115,14 @@ describe("retrying segments the model left empty", () => {
     const count = config.chunkMaxSegments * 3;
     const outcome = await translateSegments(llm, segments(count), { docType: "property_document" });
 
-    // Every segment came back empty: re-asking would only repeat the same
-    // failure at full cost, so the run reports the omissions instead.
-    expect(calls).toBe(3);
+    // Every segment came back empty. The first pass is re-asked once at half
+    // size (a smaller batch may well succeed where the full chunk did not), but
+    // two dead retries in a row mean the provider is down, not that the chunk
+    // was too big: stop and report the omissions instead of re-asking the whole
+    // document at a timeout per attempt.
+    expect(calls).toBe(5);
     expect(outcome.segments.every((s) => s.target.length === 0)).toBe(true);
+    expect(outcome.warnings.some((w) => w.includes("retries stopped after two consecutive"))).toBe(true);
   });
 });
 

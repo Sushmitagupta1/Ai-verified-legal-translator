@@ -48,11 +48,19 @@ function roleOf(b: Block): RenderRole {
   return "p";
 }
 
-/** English body text; an untranslated block stays in the source and says so. */
+/**
+ * English body text.
+ *
+ * An untranslated block must never drop its Gujarati source into the English
+ * deliverable. Doing that put OCR garble from a rotated stamp page straight into
+ * the document a reviewer hands to a client. Point at the source page and the
+ * report instead: the reviewer can read the original there, and the report
+ * already lists the block as a coverage finding.
+ */
 function englishOf(b: Block): string {
   const target = normalizeWhitespace(b.targetText ?? "");
   if (target) return target;
-  return `${normalizeWhitespace(b.sourceText)} [not translated]`;
+  return `[No English was produced for this passage — check page ${b.pageNumber} of the source against the verification report.]`;
 }
 
 function patternOf(input: ExportInput): ReportPattern {
@@ -85,6 +93,9 @@ function closingLines(r: VerificationReport | null): string[] {
   } else {
     lines.push("Automated quality indicator : not yet available (verification still running)");
   }
+  if (r) {
+    lines.push(`Report status               : ${reportStatusLine(r)}`);
+  }
   lines.push("Certification status        : NOT CERTIFIED — human review required", "", DISCLAIMER);
   if (r) {
     lines.push("", `Source SHA-256 : ${r.sourceSha256}`, `Generated      : ${r.generatedAt}`);
@@ -94,6 +105,13 @@ function closingLines(r: VerificationReport | null): string[] {
 
 const DRAFT_NOTICE =
   "Machine-generated English draft — NOT CERTIFIED. Human review required before relying on it.";
+
+/** One line that keeps a draft from being read as a finished audit. */
+function reportStatusLine(report: VerificationReport): string {
+  const status = report.status ?? "final";
+  const audit = report.semanticAudit ?? "not recorded";
+  return `${status} · meaning-level review ${audit}`;
+}
 
 const SEVERITY_MARK: Record<string, string> = {
   critical: "[CRITICAL]",
@@ -126,6 +144,7 @@ export function buildTextExport(input: ExportInput): string {
   out.push(`Translation provider : ${report.provider}`);
   out.push(`Source SHA-256       : ${report.sourceSha256}`);
   out.push(`Report generated     : ${report.generatedAt}`);
+  out.push(`Report status        : ${reportStatusLine(report)}`);
   out.push("");
   out.push(`Automated quality indicator : ${(report.fidelityIndicator.value * 100).toFixed(1)}% (${report.fidelityIndicator.grade.toUpperCase()})`);
   out.push(`Certification status        : NOT CERTIFIED — human review required`);
@@ -289,6 +308,7 @@ export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
     ["Translation provider", report.provider],
     ["Source SHA-256", report.sourceSha256],
     ["Report generated", report.generatedAt],
+    ["Report status", reportStatusLine(report)],
   ];
   for (const [k, v] of meta) {
     doc.font("Helvetica-Bold").fontSize(9).fillColor("#000").text(`${k}: `, { continued: true });
@@ -587,6 +607,7 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
     ["Translation provider", report.provider],
     ["Source SHA-256", report.sourceSha256],
     ["Report generated", report.generatedAt],
+    ["Report status", reportStatusLine(report)],
     ["Automated quality indicator", `${(ind.value * 100).toFixed(1)}% (${ind.grade.toUpperCase()}) — NOT CERTIFIED`],
   ];
 
@@ -700,96 +721,336 @@ export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
  * real heading levels, certification notice at the foot.
  */
 export async function buildTranslationDocx(input: ExportInput): Promise<Buffer> {
-  const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType } =
-    (await import("docx")) as typeof import("docx");
+  const {
+    Document,
+    Packer,
+    Paragraph,
+    TextRun,
+    HeadingLevel,
+    AlignmentType,
+    Header,
+    Footer,
+    PageNumber,
+    PageBreak,
+    BorderStyle,
+  } = (await import("docx")) as typeof import("docx");
 
   ensureDirs();
 
   const children: Array<InstanceType<typeof Paragraph>> = [];
+  const report = input.report;
+  const title = partsOf(input, "target").find((p) => p.kind === "title")?.text
+    ?? partsOf(input, "target").find((p) => p.kind === "letterhead")?.text
+    ?? input.fileName.replace(/\.[^.]+$/, "");
+  const sourceBase = input.fileName.replace(/\.[^.]+$/, "");
+  const issued = report?.generatedAt ?? new Date().toISOString();
 
+  const coverRule = (): InstanceType<typeof Paragraph> =>
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 120, after: 120 },
+      border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: "1f3d33" } },
+      children: [new TextRun({ text: "", size: 2 })],
+    });
+
+  // ── Cover ────────────────────────────────────────────────────────────────
+  // A legal translation is handed over as a document, not as loose pages. The
+  // cover carries the names and the non-certification notice so the reader
+  // cannot mistake the file for a certified translation.
+  children.push(
+    new Paragraph({ spacing: { before: 1500 }, children: [] }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 120 },
+      children: [
+        new TextRun({
+          text: (input.companyName?.trim() || sourceBase).toUpperCase(),
+          bold: true,
+          size: 22,
+          color: "1f3d33",
+          font: "Georgia",
+        }),
+      ],
+    }),
+    coverRule(),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 220, after: 80 },
+      children: [
+        new TextRun({ text: "ENGLISH TRANSLATION", bold: true, size: 44, color: "14261f", font: "Georgia" }),
+      ],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 260 },
+      children: [new TextRun({ text: title, size: 26, color: "334155", font: "Georgia", italics: true })],
+    }),
+    coverRule(),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 200 },
+      children: [
+        new TextRun({ text: `Source file  ·  ${input.fileName}`, size: 19, color: "475569", font: "Georgia" }),
+      ],
+    }),
+    report
+      ? new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [
+            new TextRun({
+              text: `${report.docTypeLabel}  ·  ${report.pageCount} page(s)  ·  ${report.segmentCount} segment(s)`,
+              size: 19,
+              color: "475569",
+              font: "Georgia",
+            }),
+          ],
+        })
+      : new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({ text: `${input.blocks.length} block(s)`, size: 19, color: "475569", font: "Georgia" })],
+        }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [
+        new TextRun({
+          text: `Issued ${new Date(issued).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}`,
+          size: 19,
+          color: "475569",
+          font: "Georgia",
+        }),
+      ],
+    }),
+    new Paragraph({ spacing: { before: 900 }, children: [] }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [
+        new TextRun({ text: "WORKING TRANSLATION — NOT CERTIFIED", bold: true, size: 18, color: "991B1B", font: "Georgia" }),
+      ],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 60 },
+      children: [
+        new TextRun({
+          text: "Machine-generated draft for professional review. Not a certified or court-certified translation.",
+          size: 16,
+          color: "7f1d1d",
+          italics: true,
+          font: "Georgia",
+        }),
+      ],
+    }),
+    new Paragraph({ children: [new PageBreak()] }),
+  );
+
+  // ── Masthead from the source document ────────────────────────────────────
   const masthead = partsOf(input, "target");
   masthead.forEach((p, i) => {
     if (p.kind === "letterhead") {
       children.push(
         new Paragraph({
           alignment: AlignmentType.CENTER,
-          children: [new TextRun({ text: p.text, bold: i === 0, size: i === 0 ? 24 : 18 })],
+          children: [new TextRun({ text: p.text, bold: i === 0, size: i === 0 ? 24 : 18, font: "Georgia", color: "1f2937" })],
         }),
       );
     } else if (p.kind === "title") {
       children.push(
         new Paragraph({
           alignment: AlignmentType.CENTER,
-          spacing: { before: 160 },
+          spacing: { before: 200, after: 120 },
           heading: HeadingLevel.HEADING_1,
-          children: [new TextRun({ text: p.text.toUpperCase(), bold: true })],
+          children: [new TextRun({ text: p.text.toUpperCase(), bold: true, font: "Georgia", color: "14261f", size: 30 })],
         }),
       );
     } else {
-      children.push(new Paragraph({ children: [new TextRun({ text: p.text, size: 20 })] }));
+      children.push(new Paragraph({ children: [new TextRun({ text: p.text, size: 20, font: "Georgia" })] }));
     }
   });
-  if (masthead.length) children.push(new Paragraph({ spacing: { before: 160 }, children: [] }));
+  if (masthead.length) {
+    children.push(
+      new Paragraph({
+        spacing: { before: 140, after: 220 },
+        border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: "cbd5e1" } },
+        children: [new TextRun({ text: "", size: 2 })],
+      }),
+    );
+  }
 
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: DRAFT_NOTICE, italics: true, color: "991B1B", size: 17 })],
-    }),
-    new Paragraph({ children: [] }),
-  );
-
+  // ── Body ─────────────────────────────────────────────────────────────────
   for (const b of bodyOf(input)) {
     const text = englishOf(b);
     if (!text.trim()) continue;
     const role = roleOf(b);
     if (role === "h1") {
-      children.push(new Paragraph({ text, heading: HeadingLevel.HEADING_1, spacing: { before: 240 } }));
+      children.push(
+        new Paragraph({
+          spacing: { before: 280, after: 120 },
+          heading: HeadingLevel.HEADING_1,
+          children: [new TextRun({ text, bold: true, font: "Georgia", color: "14261f", size: 28 })],
+        }),
+      );
     } else if (role === "h2") {
-      children.push(new Paragraph({ text, heading: HeadingLevel.HEADING_2, spacing: { before: 180 } }));
+      children.push(
+        new Paragraph({
+          spacing: { before: 200, after: 80 },
+          heading: HeadingLevel.HEADING_2,
+          children: [new TextRun({ text, bold: true, font: "Georgia", color: "1f3d33", size: 24 })],
+        }),
+      );
     } else {
-      children.push(new Paragraph({ spacing: { after: 120 }, children: [new TextRun({ text })] }));
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.JUSTIFIED,
+          spacing: { after: 140, line: 300 },
+          children: [new TextRun({ text, font: "Georgia", size: 22 })],
+        }),
+      );
     }
   }
 
-  const report = input.report;
+  // ── Closing block ────────────────────────────────────────────────────────
+  children.push(
+    new Paragraph({
+      spacing: { before: 380 },
+      border: { top: { style: BorderStyle.SINGLE, size: 6, color: "1f3d33" } },
+      children: [new TextRun({ text: "", size: 2 })],
+    }),
+    new Paragraph({
+      spacing: { before: 120 },
+      children: [
+        new TextRun({
+          text: "About this translation",
+          bold: true,
+          size: 20,
+          font: "Georgia",
+          color: "14261f",
+        }),
+      ],
+    }),
+  );
+
   if (report) {
     const ind = report.fidelityIndicator;
     const band = ind.grade === "green" ? "166534" : ind.grade === "yellow" ? "92400E" : "991B1B";
     children.push(
       new Paragraph({
-        spacing: { before: 360 },
-        children: [
-          new TextRun({ text: `Automated quality indicator: ${indicatorLine(report)} — NOT CERTIFIED`, bold: true, color: band }),
-        ],
-      }),
-      new Paragraph({ children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
-      new Paragraph({
         children: [
           new TextRun({
-            text: `Source SHA-256: ${report.sourceSha256}   ·   Generated: ${report.generatedAt}`,
-            size: 15,
-            color: "555555",
+            text: `Automated quality indicator: ${indicatorLine(report)} — NOT CERTIFIED`,
+            bold: true,
+            color: band,
+            size: 18,
+            font: "Georgia",
+          }),
+        ],
+      }),
+      new Paragraph({
+        spacing: { after: 80 },
+        children: [
+          new TextRun({
+            text: `Reviewed as: ${report.status ?? "final"}  ·  Semantic audit: ${report.semanticAudit ?? "see report"}  ·  Provider: ${report.provider}`,
+            size: 16,
+            color: "475569",
+            font: "Georgia",
           }),
         ],
       }),
     );
   } else {
     children.push(
-      new Paragraph({ spacing: { before: 360 }, children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
       new Paragraph({
         children: [
           new TextRun({
             text: "Automated quality indicator: not yet available — verification is still running.",
-            size: 15,
-            color: "555555",
+            size: 18,
+            color: "92400E",
+            font: "Georgia",
           }),
         ],
       }),
     );
   }
 
-  const doc = new Document({ sections: [{ properties: {}, children }] });
+  children.push(
+    new Paragraph({
+      spacing: { before: 80 },
+      children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "475569", font: "Georgia" })],
+    }),
+  );
+  if (report) {
+    children.push(
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: `Source SHA-256: ${report.sourceSha256}   ·   Generated: ${report.generatedAt}`,
+            size: 14,
+            color: "64748b",
+            font: "Consolas",
+          }),
+        ],
+      }),
+    );
+  }
+
+  const headerName = (input.companyName?.trim() || sourceBase).slice(0, 90);
+  const doc = new Document({
+    creator: "Nyayadoot",
+    title: `${sourceBase} — English translation`,
+    description: "Machine-generated English translation for professional review. Not certified.",
+    styles: {
+      default: {
+        document: {
+          run: { font: "Georgia", size: 22, color: "111827" },
+          paragraph: { spacing: { line: 300 } },
+        },
+      },
+    },
+    sections: [
+      {
+        properties: {
+          page: {
+            size: { width: 11906, height: 16838 },
+            margin: { top: 1247, right: 1418, bottom: 1247, left: 1418, header: 708, footer: 708 },
+          },
+        },
+        headers: {
+          default: new Header({
+            children: [
+              new Paragraph({
+                border: { bottom: { style: BorderStyle.SINGLE, size: 4, color: "cbd5e1" } },
+                children: [
+                  new TextRun({ text: headerName, size: 16, color: "64748b", font: "Georgia" }),
+                  new TextRun({ text: "\t\tEnglish translation — working draft", size: 16, color: "94a3b8", font: "Georgia" }),
+                ],
+              }),
+            ],
+          }),
+        },
+        footers: {
+          default: new Footer({
+            children: [
+              new Paragraph({
+                border: { top: { style: BorderStyle.SINGLE, size: 4, color: "e2e8f0" } },
+                children: [
+                  new TextRun({
+                    text: "Not certified — review against the Gujarati original before use.",
+                    size: 14,
+                    color: "94a3b8",
+                    font: "Georgia",
+                  }),
+                  new TextRun({ text: "\t\tPage ", size: 14, color: "64748b", font: "Georgia" }),
+                  new TextRun({ children: [PageNumber.CURRENT], size: 14, color: "64748b", font: "Georgia" }),
+                  new TextRun({ text: " of ", size: 14, color: "64748b", font: "Georgia" }),
+                  new TextRun({ children: [PageNumber.TOTAL_PAGES], size: 14, color: "64748b", font: "Georgia" }),
+                ],
+              }),
+            ],
+          }),
+        },
+        children,
+      },
+    ],
+  });
   return Packer.toBuffer(doc);
 }
 

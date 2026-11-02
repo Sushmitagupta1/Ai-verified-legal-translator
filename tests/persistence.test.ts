@@ -234,6 +234,21 @@ describe("currency survives segmentation", () => {
   });
 });
 
+describe("finding titles stay readable in English", () => {
+  it("glosses Gujarati legal-reference surfaces while keeping the source as evidence", () => {
+    const src = "આ કાયદો કલમ ૫૨ અને રૂ. ૫૦,૦૦૦ ની સંબંધમાં છે.";
+    const { findings } = verify.verifyDatums(input(src, "This law relates to the matter."));
+
+    const section = findings.filter((f) => f.check === "datum.section_ref_missing");
+    const amount = findings.filter((f) => f.check === "datum.currency_missing");
+    expect(section).toHaveLength(1);
+    expect(section[0].title).toBe('Legal reference "Section 52" missing from the translation');
+    expect(section[0].sourceExcerpt).toContain("કલમ");
+    expect(amount).toHaveLength(1);
+    expect(amount[0].title).toBe('Amount "Rs. 50,000" missing from the translation');
+  });
+});
+
 describe("script detection at segmentation", () => {
   const block = (id: string, ordinal: number, sourceText: string) => ({
     id,

@@ -50,6 +50,17 @@ export interface VerificationReport {
   sourceSha256: string;
   segmentCount: number;
 
+  /**
+   * `draft` is written the moment the deterministic checks have run, so a
+   * reviewer can start reading while the semantic pass is still going. `final`
+   * is written once the semantic verdict is in.
+   */
+  status?: "draft" | "final";
+  /** How much of the document the meaning-level audit actually covered. */
+  semanticAudit?: "pending" | "complete" | "partial" | "skipped";
+  /** When the run finished; null on a draft. */
+  completedAt?: string | null;
+
   /** Explicitly labelled indicator — never presented as accuracy. */
   fidelityIndicator: {
     value: number;
@@ -58,7 +69,7 @@ export interface VerificationReport {
     interpretation: string;
   };
 
-  mechanicalChecks: Array<{ check: string; description: string; count: number; passed: boolean }>;
+  mechanicalChecks: Array<{ check: string; description: string; count: number; passed: boolean; pending?: boolean }>;
 
   findings: Array<{
     id: string;
@@ -86,6 +97,11 @@ export interface VerificationReport {
   };
 }
 
+export interface ReportMeta {
+  status?: "draft" | "final";
+  semanticAudit?: VerificationReport["semanticAudit"];
+}
+
 /**
  * Assemble the report.
  *
@@ -94,7 +110,11 @@ export interface VerificationReport {
  * automated quality indicator, its components are itemised, and the counts of what
  * was actually checked are printed so the number is auditable rather than magical.
  */
-export function buildReport(input: ReportInput, narrative: ReportNarrative): VerificationReport {
+export function buildReport(
+  input: ReportInput,
+  narrative: ReportNarrative,
+  meta: ReportMeta = {},
+): VerificationReport {
   const v = input.verification;
   const datumCount = v.datums.length;
   const changedOrMissing = v.datums.filter((d) => d.status === "changed" || d.status === "missing" || d.status === "added").length;
@@ -155,9 +175,12 @@ export function buildReport(input: ReportInput, narrative: ReportNarrative): Ver
         ? v.judge.complete
           ? "Compared each source segment with its English for meaning-level divergence: omission, addition, changed data, altered scope or modality, inverted negation, misidentified participant."
           : `Compared ${v.judge.blocksJudged} of ${v.judge.blocksTotal} source blocks with their English for meaning-level divergence. One or more audit batches did not run, so the remaining blocks are not covered by this check.`
-        : "Not run. No language model was available for the meaning-level comparison, so negation, modality and scope changes are not covered by this report.",
+        : meta.status === "draft"
+          ? "Pending. This draft was written from the deterministic checks while the meaning-level review is still running; it will be updated when that review finishes."
+          : "Not run. No language model was available for the meaning-level comparison, so negation, modality and scope changes are not covered by this report.",
       count: v.judge.segments.length,
       passed: v.judge.available && v.judge.complete && v.judge.documentFaithful,
+      pending: meta.status === "draft" && !v.judge.available,
     },
   ];
 
@@ -171,6 +194,12 @@ export function buildReport(input: ReportInput, narrative: ReportNarrative): Ver
     provider: input.providerLabel,
     sourceSha256: input.sourceSha256,
     segmentCount: input.segmentCount,
+
+    status: meta.status ?? "final",
+    semanticAudit:
+      meta.semanticAudit ??
+      (v.judge.available ? (v.judge.complete ? "complete" : "partial") : "skipped"),
+    completedAt: (meta.status ?? "final") === "draft" ? null : new Date().toISOString(),
 
     fidelityIndicator: {
       value: v.score.total,
@@ -232,6 +261,63 @@ interface NarrativeFields {
   reviewFocus?: string[];
   limitations?: string[];
   recommendedAction?: string;
+}
+
+/**
+ * Narrative written from the computed counts.
+ *
+ * A language model adds no facts here: every number already exists, and asking
+ * a local 12B model to phrase them costs minutes. This is the default so the
+ * report is ready as soon as verification finishes.
+ */
+export function deterministicNarrative(input: ReportInput): ReportNarrative {
+  const v = input.verification;
+  const datumCount = v.datums.length;
+  const termCount = v.termPlan.reduce((a, t) => a + t.count, 0);
+  const critical = v.findings.filter((f) => f.severity === "critical").length;
+  const major = v.findings.filter((f) => f.severity === "major").length;
+  const minor = v.findings.filter((f) => f.severity === "minor").length;
+  const semantic = v.judge.available
+    ? v.judge.complete
+      ? "The meaning-level review covered every block."
+      : `The meaning-level review covered ${v.judge.blocksJudged} of ${v.judge.blocksTotal} blocks; the rest rely on deterministic checks.`
+    : "The meaning-level review did not run, so negation, modality and scope were not assessed.";
+
+  const byCategory = new Map<string, number>();
+  for (const f of v.findings) {
+    if (f.severity === "critical") byCategory.set(f.category, (byCategory.get(f.category) ?? 0) + 1);
+  }
+  const topCategories = [...byCategory.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  return {
+    executiveSummary:
+      `${input.fileName} was processed as a ${input.docTypeLabel} of ${input.pageCount} page(s). ` +
+      `Automated checks compared ${datumCount} data item(s) and ${termCount} terminology occurrence(s) ` +
+      `across ${v.coverage.totalBlocks} block(s), producing ${input.segmentCount} English segment(s). ` +
+      `${v.findings.length} finding(s) were raised: ${critical} critical, ${major} major and ${minor} minor. ${semantic}`,
+    reviewFocus:
+      v.findings.length === 0
+        ? ["Read the translation against the original before signing it."]
+        : [
+            ...topCategories.map(
+              ([category, n]) => `The ${n} critical ${category.toLowerCase()} finding(s) listed below.`,
+            ),
+            "Every party, witness and property identifier, checked by eye against the Gujarati.",
+            "Any clause where the English changes who may, shall or may not act.",
+          ],
+    limitations: [
+      "The fidelity indicator is an automated review-prioritisation score, not a measure of translation accuracy.",
+      "Terminology compliance is measured against a house glossary, not against a qualified translator's judgement.",
+      v.judge.available && v.judge.complete
+        ? "Meaning-level findings are advisory and require human confirmation."
+        : "Meaning-level review is incomplete or absent; treat those blocks as unverified.",
+    ],
+    recommendedAction:
+      critical > 0
+        ? "Resolve every critical finding, then have a qualified legal translator compare the full English against the Gujarati original before use."
+        : "Have a qualified legal translator compare the English against the Gujarati original before relying on it, then complete the certification block.",
+    modelGenerated: false,
+  };
 }
 
 /** Prompt the model for the narrative sections only. Counts come from the data. */

@@ -6,7 +6,7 @@ import {
   loadReport,
   loadTranslation,
 } from "@/lib/pipeline/run";
-import { getJobState } from "@/lib/server/jobs";
+import { getJobState, getStageTimings, queuePosition } from "@/lib/server/jobs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -61,7 +61,9 @@ export async function GET(
   return NextResponse.json({
     document,
     job: getJobState(id),
+    queuePosition: queuePosition(id),
     report,
+    timings: getStageTimings(id),
     segmentCount: segments.length,
     blockCount: blocks.length,
     segments,

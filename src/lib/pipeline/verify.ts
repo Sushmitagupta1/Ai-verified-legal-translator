@@ -1,6 +1,6 @@
 ﻿import { config } from "../config";
 import { DISCLAIMER, type Datum, type Finding, type Severity } from "../domain";
-import { normalizeWhitespace } from "../domain/gujarati";
+import { normalizeWhitespace, toAsciiDigits } from "../domain/gujarati";
 import { VERIFIER_SYSTEM, buildVerifierPrompt } from "../llm/prompts";
 import { parseJson } from "../llm/provider";
 import type { LlmClient } from "../llm/provider";
@@ -56,11 +56,15 @@ export interface JudgeResult {
   documentFaithful: boolean;
   /** At least one batch produced verdicts. */
   available: boolean;
-  /** Every batch produced verdicts; false means part of the document is unjudged. */
+  /** Every block produced a verdict; false means part of the document is unjudged. */
   complete: boolean;
   /** Blocks the judge returned verdicts for, and how many were sent to it. */
   blocksJudged: number;
   blocksTotal: number;
+  /** True when a small screening model was used before the strong judge. */
+  fastScreened?: boolean;
+  /** Blocks the fast screen handed to the stronger model. */
+  escalatedBlocks?: number;
 }
 
 export interface ScoreBreakdown {
@@ -161,7 +165,7 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
               blockId,
               datumId: sd.id,
               pageNumber,
-              title: `Name "${sd.surface}" not found in the translation`,
+              title: `Name "${displaySurface(sd.surface)}" not found in the translation`,
               detail: `The source contains the name "${sd.surface}", which does not appear in the corresponding English. A missing party or witness name can invalidate a document.`,
               suggestion: "Re-translate this segment, or enter the correct name manually.",
               sourceExcerpt: sd.context,
@@ -200,7 +204,7 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
               blockId,
               datumId: sd.id,
               pageNumber,
-              title: `Ambiguous source date "${sd.surface}"`,
+              title: `Ambiguous source date "${displaySurface(sd.surface)}"`,
               detail:
                 `"${sd.surface}" can be read as ${readings.join(" or ")}. The translation used one reading. ` +
                 "Confirm the intended date against the original.",
@@ -220,7 +224,7 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
               blockId,
               datumId: sd.id,
               pageNumber,
-              title: `Ambiguous source date "${sd.surface}" is absent from the translation`,
+              title: `Ambiguous source date "${displaySurface(sd.surface)}" is absent from the translation`,
               detail:
                 `"${sd.surface}" can be read as ${readings.join(" or ")}, and no date in the translation ` +
                 "matches either reading.",
@@ -282,7 +286,7 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
             blockId,
             datumId: sd.id,
             pageNumber,
-            title: `${labelFor(sd.kind)} changed: "${sd.surface}" → "${nearby.datum.surface}"`,
+            title: `${labelFor(sd.kind)} changed: "${displaySurface(sd.surface)}" → "${displaySurface(nearby.datum.surface)}"`,
             detail:
               `The source states "${sd.surface}" but the translation states "${nearby.datum.surface}". ` +
               "A changed figure, date, section or reference is a substantive translation error, not a style issue.",
@@ -308,7 +312,7 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
           blockId,
           datumId: sd.id,
           pageNumber,
-          title: `${labelFor(sd.kind)} "${sd.surface}" missing from the translation`,
+          title: `${labelFor(sd.kind)} "${displaySurface(sd.surface)}" missing from the translation`,
           detail:
             `"${sd.surface}" appears in the Gujarati source but no corresponding ${labelFor(sd.kind).toLowerCase()} ` +
             "was found in the English. It was either dropped or rendered in a form this check cannot recognise.",
@@ -368,6 +372,35 @@ function categoryFor(kind: Datum["kind"]): string {
   }
 }
 
+/**
+ * A datum surface as it should read in an English finding title.
+ *
+ * Finding titles are read at a glance, so `કલમ ૫૨`, `નિયમ ૪(૭)` and
+ * `રૂ. ૫૦,૦૦૦` are spelled out as `Section 52`, `Rule 4(7)` and `Rs. 50,000`.
+ * The `sourceExcerpt` on the same finding keeps the Gujarati verbatim as
+ * evidence. Proper names are deliberately left alone: automatic transliteration
+ * is guesswork, and the excerpt already shows the original spelling.
+ */
+const TITLE_GLOSS: Array<[RegExp, string]> = [
+  [/ધારા|કલમ/g, "Section"],
+  [/અનુચ્છેદ/g, "Article"],
+  [/નિયમન/g, "Regulation"],
+  [/નિયમ/g, "Rule"],
+  [/પ્રકરણ/g, "Chapter"],
+  [/અનુસૂચિ/g, "Schedule"],
+  [/ખંડ/g, "Clause"],
+  [/અંગ/g, "Part"],
+  [/વિગત/g, "Item"],
+  [/રૂપિયા|રૂ\.?/g, "Rs. "],
+  [/ટકા|ટકે/g, "%"],
+];
+
+export function displaySurface(surface: string): string {
+  let out = toAsciiDigits(surface);
+  for (const [re, en] of TITLE_GLOSS) out = out.replace(re, en);
+  return out.replace(/\s+/g, " ").trim();
+}
+
 function labelFor(kind: Datum["kind"]): string {
   switch (kind) {
     case "currency":
@@ -379,7 +412,7 @@ function labelFor(kind: Datum["kind"]): string {
     case "percentage":
       return "Percentage";
     case "section_ref":
-      return "Section reference";
+      return "Legal reference";
     case "case_number":
       return "Case number";
     case "statute":
@@ -388,6 +421,10 @@ function labelFor(kind: Datum["kind"]): string {
       return "Name";
     case "party_name":
       return "Party name";
+    case "place":
+      return "Place";
+    case "address_pin":
+      return "PIN code";
     case "count_phrase":
       return "Count";
     default:
@@ -622,101 +659,293 @@ function indicRatio(s: string): number {
  * exception inverted. It is also the least reliable, which is why its output is
  * advisory and every finding it raises still requires human confirmation.
  */
+export interface JudgeOptions {
+  signal?: AbortSignal;
+  /** Strong judge model. */
+  model?: string;
+  /** Fast screening model. Empty keeps the single-model path. */
+  fastModel?: string;
+  /** Wall-clock budget for the whole pass, screen and escalation. */
+  budgetMs?: number;
+  /** Hard per-request cap. */
+  timeoutMs?: number;
+  /** Blocks per strong-model request. */
+  blocksPerCall?: number;
+  /** Blocks per fast-screen request. */
+  fastBlocksPerCall?: number;
+  /** Escalate a block when the fast judge is less confident than this. */
+  escalateBelow?: number;
+  /**
+   * Block ids the deterministic checks already flagged. They always go to the
+   * strong judge, even when the fast screen clears them, and are reviewed first
+   * so the budget is spent where the evidence of a problem already exists.
+   */
+  mustJudge?: string[];
+}
+
+interface ParsedJudgeBatch {
+  segments: JudgeSegment[];
+  documentNotes: string[];
+}
+
+function unavailableJudge(total: number): JudgeResult {
+  return {
+    segments: [],
+    documentNotes: [],
+    documentFaithful: true,
+    available: false,
+    complete: false,
+    blocksJudged: 0,
+    blocksTotal: total,
+  };
+}
+
 export async function runJudge(
   llm: LlmClient,
   input: VerifyInput,
-  opts: { signal?: AbortSignal; model?: string } = {},
+  opts: JudgeOptions = {},
 ): Promise<JudgeResult> {
-  if (!llm.available) {
-    return {
-      segments: [],
-      documentNotes: [],
-      documentFaithful: true,
-      available: false,
-      complete: false,
-      blocksJudged: 0,
-      blocksTotal: 0,
-    };
+  if (!llm.available) return unavailableJudge(input.blockIds.length);
+
+  const total = input.blockIds.length;
+  const strongModel = opts.model || config.llm.judgeModel || undefined;
+  const fastModel = opts.fastModel || config.llm.judgeFastModel || undefined;
+  // Screening only makes sense with a model different from the strong judge;
+  // otherwise it doubles the calls for no quality gain.
+  const useFastScreen = Boolean(fastModel && fastModel !== strongModel);
+
+  const budgetMs = opts.budgetMs ?? config.llm.judgeBudgetMs;
+  const timeoutMs = opts.timeoutMs ?? config.llm.judgeTimeoutMs;
+  const escalateBelow = opts.escalateBelow ?? config.llm.judgeEscalateBelow;
+  const startedAt = Date.now();
+  const budgetLeft = () => budgetMs <= 0 || Date.now() - startedAt < budgetMs;
+
+  /**
+   * Time left for a request, never below a short floor.
+   *
+   * Clamping to the budget is what keeps the final report from arriving minutes
+   * late: without it a strong-model call started at 3:59 of a 4:00 budget still
+   * got its full 180-second timeout, so the report landed at 7:00. A request
+   * that cannot finish inside the budget now fails fast instead.
+   */
+  const MIN_REQUEST_MS = 1_000;
+  const remainingMs = () =>
+    budgetMs <= 0 ? Number.POSITIVE_INFINITY : Math.max(0, budgetMs - (Date.now() - startedAt));
+  const range = (start: number, end: number) => Array.from({ length: end - start }, (_, k) => start + k);
+
+  const verdicts = new Map<number, JudgeSegment>();
+  const documentNotes: string[] = [];
+
+  // A deterministic finding is direct evidence of a problem in that block. The
+  // fast screen can still clear it — the 7B model missed "નીચેની વિગતેનાં
+  // વેચાણ અવેજથી" rendered as "the amount less than Rs.17,58,000" — so these
+  // blocks are never left to the screen alone.
+  const mustJudge = new Set<number>();
+  for (const id of opts.mustJudge ?? []) {
+    const index = input.blockIds.indexOf(id);
+    if (index >= 0) mustJudge.add(index);
   }
 
-  // Audit in batches, not one request for the whole document. A 23-page deed
-  // in a single prompt asks a 14B model for a very long generation on a GPU it
-  // does not fit; when that request hit the 600 s timeout the whole stage
-  // stalled for 25 minutes and then reported no semantic coverage at all.
-  // Small batches bound each failure to one batch and keep partial coverage.
-  const BLOCKS_PER_CALL = 8;
-  // A 12B model on an 8 GiB GPU writes ~7.5 tokens/s, so eight blocks of legal
-  // prose can genuinely take longer than 150 s. That cap timed out one batch on
-  // a real deed and threw away the five that had answered.
-  const JUDGE_TIMEOUT_MS = 240_000;
-
-  const segments: JudgeResult["segments"] = [];
-  const documentNotes: string[] = [];
-  let succeeded = 0;
-  let failed = 0;
-
-  for (let start = 0; start < input.blockIds.length; start += BLOCKS_PER_CALL) {
-    const end = Math.min(input.blockIds.length, start + BLOCKS_PER_CALL);
+  /**
+   * One request. Batches, not the whole document: a 23-page deed in a single
+   * prompt asks a local model for a very long generation on a GPU it may not
+   * fit, and one timeout then discards every verdict.
+   */
+  const judgeBatch = async (indices: number[], model?: string): Promise<ParsedJudgeBatch> => {
     const batch: VerifyInput = {
       ...input,
-      sourceTexts: input.sourceTexts.slice(start, end),
-      blockIds: input.blockIds.slice(start, end),
-      pageNumbers: input.pageNumbers.slice(start, end),
+      sourceTexts: indices.map((i) => input.sourceTexts[i] ?? ""),
+      blockIds: indices.map((i) => input.blockIds[i] ?? ""),
+      pageNumbers: indices.map((i) => input.pageNumbers[i] ?? 1),
     };
+    const count = indices.length;
+    const requestTimeout = Math.max(MIN_REQUEST_MS, Math.min(timeoutMs, remainingMs()));
 
-    try {
-      const raw = await llm.complete(
-        [
-          { role: "system", content: VERIFIER_SYSTEM },
-          { role: "user", content: buildJudgePrompt(batch) },
-        ],
-        {
-          json: true,
-          signal: withTimeout(opts.signal, JUDGE_TIMEOUT_MS),
-          model: opts.model || config.llm.judgeModel || undefined,
-          temperature: 0,
-        },
-      );
+    const raw = await llm.complete(
+      [
+        { role: "system", content: VERIFIER_SYSTEM },
+        { role: "user", content: buildJudgePrompt(batch) },
+      ],
+      {
+        json: true,
+        signal: withTimeout(opts.signal, requestTimeout),
+        model,
+        temperature: 0,
+        // One verdict per block, plus any issues it raises. Asking for the
+        // client's 8k default on top of a 12-block prompt exceeds a local
+        // model's context window, and the reply arrives truncated mid-JSON,
+        // which parses to nothing and silently loses the whole batch.
+        maxOutputTokens: Math.min(4_096, Math.max(1_024, 400 + count * 320)),
+      },
+    );
 
-      const parsed = parseJson<{
-        segments?: Array<{ index?: number; faithful?: boolean; issues?: JudgeIssue[]; confidence?: number }>;
-        documentNotes?: string[];
-      }>(raw);
+    const parsed = parseJson<{
+      segments?: Array<{
+        /** The prompt asks for `id`; some models answer `index` instead. */
+        id?: number | string;
+        index?: number | string;
+        faithful?: boolean;
+        issues?: JudgeIssue[];
+        confidence?: number;
+      }>;
+      documentNotes?: string[];
+    }>(raw);
 
-      for (const s of parsed.segments ?? []) {
-        const local = s.index ?? -1;
-        segments.push({
-          index: local >= 0 && local < end - start ? local + start : local,
-          faithful: Boolean(s.faithful),
-          issues: s.issues ?? [],
-          confidence: typeof s.confidence === "number" ? Math.min(1, Math.max(0, s.confidence)) : 0.6,
-        });
+    const segments: JudgeSegment[] = [];
+    for (const s of parsed.segments ?? []) {
+      const rawId = s.id ?? s.index;
+      const local =
+        typeof rawId === "number"
+          ? rawId
+          : typeof rawId === "string" && /^\d+$/.test(rawId.trim())
+            ? Number(rawId.trim())
+            : -1;
+      // A small model often renumbers a batch 0..n-1. Map that back to the real
+      // block index through the batch's index list when the number is a
+      // position, and otherwise trust it only if it points inside the document.
+      const index = local >= 0 && local < count ? indices[local] : local;
+      if (index < 0 || index >= total) continue;
+      segments.push({
+        index,
+        faithful: Boolean(s.faithful),
+        issues: s.issues ?? [],
+        confidence: typeof s.confidence === "number" ? Math.min(1, Math.max(0, s.confidence)) : 0.6,
+      });
+    }
+    return { segments, documentNotes: parsed.documentNotes ?? [] };
+  };
+
+  const commit = (batch: ParsedJudgeBatch) => {
+    for (const seg of batch.segments) verdicts.set(seg.index, seg);
+    documentNotes.push(...batch.documentNotes);
+  };
+
+  const failNote = (indices: number[], err: unknown) => {
+    const first = (indices[0] ?? 0) + 1;
+    const last = (indices[indices.length - 1] ?? 0) + 1;
+    const where = indices.length === 1 ? `${first}` : `${first}-${last}`;
+    documentNotes.push(
+      `Semantic verification did not run for blocks ${where}: ${
+        err instanceof Error ? err.message : "unknown error"
+      }. Deterministic checks still cover those blocks.`,
+    );
+  };
+
+  let escalatedBlocks = 0;
+
+  if (!useFastScreen) {
+    const per = Math.max(1, opts.blocksPerCall ?? config.llm.judgeBlocksPerCall);
+    for (let start = 0; start < total; start += per) {
+      if (!budgetLeft()) {
+        documentNotes.push(
+          `Semantic review stopped at block ${start} of ${total} to keep the report on time. ` +
+            "Deterministic checks still cover the blocks that were not judged.",
+        );
+        break;
       }
-      documentNotes.push(...(parsed.documentNotes ?? []));
-      succeeded += 1;
-    } catch (err) {
-      failed += 1;
-      documentNotes.push(
-        `Semantic verification did not run for blocks ${start + 1}-${end}: ${
-          err instanceof Error ? err.message : "unknown error"
-        }. Deterministic checks still cover those blocks.`,
-      );
+      const indices = range(start, Math.min(total, start + per));
+      try {
+        commit(await judgeBatch(indices, strongModel));
+      } catch (err) {
+        failNote(indices, err);
+      }
+    }
+  } else {
+    const fastPer = Math.max(1, opts.fastBlocksPerCall ?? config.llm.judgeFastBlocksPerCall);
+    const escalate = new Set<number>();
+
+    for (let start = 0; start < total; start += fastPer) {
+      if (!budgetLeft()) {
+        documentNotes.push(`Fast semantic screen stopped at block ${start} of ${total} to keep the report on time.`);
+        break;
+      }
+      const end = Math.min(total, start + fastPer);
+      try {
+        const batch = await judgeBatch(range(start, end), fastModel);
+        commit(batch);
+        const byIndex = new Map(batch.segments.map((s) => [s.index, s]));
+        const seen = new Set<number>();
+        for (let i = start; i < end; i++) {
+          const verdict = byIndex.get(i);
+          if (verdict) seen.add(i);
+          // No verdict, an explicit failure, or a verdict the screen itself is
+          // unsure about all warrant the stronger model. A confident pass does
+          // not: that is the whole point of screening.
+          if (!verdict || !verdict.faithful || verdict.confidence < escalateBelow) {
+            escalate.add(i);
+          }
+        }
+        // A batch that answered nothing is a screen failure, not a pass.
+        if (seen.size === 0) for (let i = start; i < end; i++) escalate.add(i);
+      } catch {
+        for (let i = start; i < end; i++) escalate.add(i);
+      }
+    }
+
+    for (const i of mustJudge) escalate.add(i);
+
+    const toEscalate = [...escalate].sort((a, b) => a - b);
+    escalatedBlocks = toEscalate.length;
+    const strongPer = Math.max(1, opts.blocksPerCall ?? config.llm.judgeBlocksPerCall);
+
+    // Priority blocks are packed tightly into their own request-sized batches.
+    // Grouping only contiguous ranges used to give each scattered high-risk
+    // block its own 40-second call, so the budget expired before the later ones
+    // — including the page-6 sale-price contradiction — were ever reviewed.
+    const priority = [...mustJudge].sort((a, b) => a - b);
+    const rest = toEscalate.filter((i) => !mustJudge.has(i));
+    const batches: number[][] = [];
+    for (let i = 0; i < priority.length; i += strongPer) {
+      batches.push(priority.slice(i, i + strongPer));
+    }
+    for (const [rangeStart, rangeEnd] of contiguousRanges(rest)) {
+      for (let start = rangeStart; start < rangeEnd; start += strongPer) {
+        batches.push(range(start, Math.min(rangeEnd, start + strongPer)));
+      }
+    }
+
+    for (const indices of batches) {
+      if (!budgetLeft()) {
+        documentNotes.push(
+          `Strong semantic review stopped after ${verdicts.size} of ${total} blocks to keep the report on time. ` +
+            "The blocks the fast screen could not clear are listed for human review.",
+        );
+        break;
+      }
+      try {
+        commit(await judgeBatch(indices, strongModel));
+      } catch (err) {
+        failNote(indices, err);
+      }
     }
   }
+
+  const segments = [...verdicts.values()].sort((a, b) => a.index - b.index);
 
   return {
     segments,
     documentNotes,
     documentFaithful: segments.every((s) => s.faithful),
     // A judge that returns no verdicts judged nothing: that is not a pass. But
-    // one failed batch must not discard the batches that did answer - on a real
-    // deed that turned 29 judged segments into "semantic review did not run".
-    // `complete` keeps the partial coverage visible instead of hiding it.
+    // one failed batch must not discard the batches that did answer.
     available: segments.length > 0,
-    complete: failed === 0 && succeeded > 0 && segments.length > 0,
-    blocksJudged: Math.min(segments.length, input.blockIds.length),
-    blocksTotal: input.blockIds.length,
+    complete: segments.length >= total && total > 0,
+    blocksJudged: segments.length,
+    blocksTotal: total,
+    fastScreened: useFastScreen,
+    escalatedBlocks,
   };
+}
+
+/** Group sorted indices into [start, end) ranges so escalation stays batched. */
+function contiguousRanges(indices: number[]): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const i of indices) {
+    const last = out[out.length - 1];
+    if (last && i === last[1]) last[1] = i + 1;
+    else out.push([i, i + 1]);
+  }
+  return out;
 }
 
 /** Caller cancellation plus a hard per-request budget. */
@@ -873,41 +1102,89 @@ function round(n: number): number {
 
 // ── Orchestration ────────────────────────────────────────────────────────────
 
-export async function verifyDocument(
-  llm: LlmClient,
-  input: VerifyInput,
-  opts: { signal?: AbortSignal; judgeModel?: string } = {},
-): Promise<VerificationResult> {
-  const warnings: string[] = [];
+/** Pure, fast checks. No model, so they can run the moment the translation lands. */
+export interface DeterministicResult {
+  findings: Finding[];
+  datums: Datum[];
+  alignment: AlignmentResult;
+  coverage: ReturnType<typeof computeCoverage>;
+  termPlan: AppliedTerm[];
+}
 
+export function verifyDeterministic(input: VerifyInput): DeterministicResult {
   const structural = verifyStructure(input);
   const { datums, findings: datumFindings } = verifyDatums(input);
   const { plan, findings: termFindings } = verifyTerminology(input);
 
-  const judge = await runJudge(llm, input, { signal: opts.signal, model: opts.judgeModel });
+  return {
+    findings: [...structural.findings, ...datumFindings, ...termFindings],
+    datums,
+    alignment: structural.alignment,
+    coverage: structural.coverage,
+    termPlan: plan,
+  };
+}
+
+/** A judge placeholder used while the semantic pass is still running. */
+export function pendingJudge(total: number): JudgeResult {
+  return unavailableJudge(total);
+}
+
+/** Combine the deterministic checks with a semantic verdict into a scored result. */
+export function finalizeVerification(
+  det: DeterministicResult,
+  judge: JudgeResult,
+  input: VerifyInput,
+): VerificationResult {
+  const warnings: string[] = [];
+
   if (!judge.available) {
     warnings.push("Semantic verification did not run; the fidelity indicator is capped and less meaningful than usual.");
+  } else if (!judge.complete) {
+    warnings.push(
+      `Semantic verification covered ${judge.blocksJudged} of ${judge.blocksTotal} blocks; the unjudged blocks rely on deterministic checks only.`,
+    );
   }
 
-  const findings = [...structural.findings, ...datumFindings, ...termFindings, ...judgeFindings(judge, input)];
+  const findings = [...det.findings, ...judgeFindings(judge, input)];
   const score = scoreVerification(findings, {
-    coverage: structural.coverage,
+    coverage: det.coverage,
     judge,
     meanOcrConfidence: input.meanOcrConfidence,
-    datumCount: datums.length,
-    termCount: plan.reduce((a, t) => a + t.count, 0),
+    datumCount: det.datums.length,
+    termCount: det.termPlan.reduce((a, t) => a + t.count, 0),
   });
 
   return {
     findings,
-    datums,
+    datums: det.datums,
     score,
-    alignment: structural.alignment,
-    coverage: structural.coverage,
-    termPlan: plan,
+    alignment: det.alignment,
+    coverage: det.coverage,
+    termPlan: det.termPlan,
     judge,
     warnings,
   };
+}
+
+export async function verifyDocument(
+  llm: LlmClient,
+  input: VerifyInput,
+  opts: {
+    signal?: AbortSignal;
+    judgeModel?: string;
+    judgeFastModel?: string;
+    judgeBudgetMs?: number;
+  } = {},
+): Promise<VerificationResult> {
+  const deterministic = verifyDeterministic(input);
+  const judge = await runJudge(llm, input, {
+    signal: opts.signal,
+    model: opts.judgeModel,
+    fastModel: opts.judgeFastModel,
+    budgetMs: opts.judgeBudgetMs,
+  });
+  return finalizeVerification(deterministic, judge, input);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

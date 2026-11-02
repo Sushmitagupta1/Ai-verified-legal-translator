@@ -219,6 +219,23 @@ describe("clean translation export", () => {
     expect(text).toContain("abc123");
   });
 
+  it("never leaves the Gujarati source in the English body", () => {
+    const untranslated = block("body", "આ પાનું અસ્પષ્ટ છે અને વાંચી શકાતું નથી.");
+    const text = buildTranslationText({
+      docId: "d-test",
+      fileName: "scan.pdf",
+      blocks: [block("body", "VISHAL M. KOTHARI", "VISHAL M. KOTHARI"), untranslated],
+      report: report(),
+    });
+
+    // Regression: an empty target used to fall back to the raw source plus
+    // "[not translated]", so the "English" document a reviewer downloaded was
+    // partly Gujarati OCR garble from a rotated stamp page.
+    expect(text).not.toMatch(/[\u0A80-\u0AFF\u0900-\u097F]/);
+    expect(text).toContain("No English was produced");
+    expect(text).toContain("page 1");
+  });
+
   it("substitutes an override company name in the header", () => {
     const text = buildTranslationText({
       docId: "d-test",

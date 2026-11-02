@@ -10,9 +10,17 @@ import { createLlmClient, providerDisplayName } from "../llm";
 import type { LlmClient } from "../llm/provider";
 import { describeBackends } from "./backends";
 import { extractFromBuffer, prepare, type ExtractResult, type PageText } from "./extract";
-import { buildReport, generateNarrative, type ReportInput, type VerificationReport } from "./report";
+import { buildReport, deterministicNarrative, generateNarrative, type ReportInput, type VerificationReport } from "./report";
 import { buildSegments, translateSegments, type Segment, type TranslatedSegment } from "./translate";
-import { verifyDocument, type VerificationResult } from "./verify";
+import {
+  finalizeVerification,
+  pendingJudge,
+  runJudge,
+  verifyDeterministic,
+  type DeterministicResult,
+  type VerificationResult,
+  type VerifyInput,
+} from "./verify";
 import { exportDocument, type ExportFormat } from "./export";
 
 export type Stage =
@@ -97,6 +105,8 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   let prepared: ReturnType<typeof prepare>;
   let translated: TranslatedSegment[] = [];
   let segments: Segment[] = [];
+  /** Deterministic checks already computed for the draft report, reused for the final one. */
+  let deterministic: DeterministicResult | null = null;
 
   if (opts.verifyOnly) {
     const stored = loadBlocks(opts.documentId);
@@ -155,7 +165,7 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
       modelGenerated: false,
     };
     const reportDoc = buildReport(
-      makeReportInput(opts, prepared, verification, llm, sha256, 0, narrative),
+      makeReportInput(opts, prepared, verification, llm, sha256, 0),
       narrative,
     );
     setBlocked(opts.documentId, prepared.blockReasons);
@@ -223,6 +233,40 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
     setStage(opts.documentId, "translated", `Translated ${translated.length} segments`);
     persistTranslation(opts.documentId, prepared.blocks, translated);
     opts.onProgress?.("translated", `Translated ${translated.length} segments`, 70);
+
+    // Everything the report needs that does not require a model is available
+    // now. Writing the draft here is what makes the report arrive with the Word
+    // file instead of ten minutes later; the semantic pass fills in the rest.
+    try {
+      const draftInput = buildVerifyInput(prepared, translated);
+      deterministic = verifyDeterministic(draftInput);
+      const draftVerification = finalizeVerification(
+        deterministic,
+        pendingJudge(prepared.blocks.length),
+        draftInput,
+      );
+      const draftReportInput = makeReportInput(
+        opts,
+        prepared,
+        draftVerification,
+        llm,
+        sha256,
+        translated.length,
+      );
+      persistDraftReport(
+        opts.documentId,
+        buildReport(draftReportInput, deterministicNarrative(draftReportInput), {
+          status: "draft",
+          semanticAudit: "pending",
+        }),
+      );
+      opts.onProgress?.("translated", "Report draft ready — checking the translation", 73);
+    } catch (err) {
+      // A draft is an optimisation, never a gate on the Word file.
+      warnings.push(
+        `The draft report could not be written (${err instanceof Error ? err.message : "unknown error"}); the final report will still be produced.`,
+      );
+    }
   } else {
     translated = loadTranslation(opts.documentId);
     if (translated.length === 0) {
@@ -231,43 +275,54 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   }
 
   // ── Verify ─────────────────────────────────────────────────────────────────
-  report("verified", "Running verification", 75);
+  const verifyInput = buildVerifyInput(prepared, translated);
+  deterministic ??= verifyDeterministic(verifyInput);
 
-  const sourceTexts = prepared.blocks.map((b) => b.sourceText);
-  const blockIds = prepared.blocks.map((b) => b.id);
-  const pageNumbers = prepared.blocks.map((b) => b.pageNumber);
+  report("verified", "Auditing the translation", 76);
+  // The semantic screen is cheap but fallible. Blocks with a critical finding,
+  // or a major finding in a category that changes legal meaning, go to the
+  // strong judge unconditionally. On the 23-page benchmark this is 21 blocks,
+  // not the whole document, and it is where a wrong date, amount or section
+  // reference is most likely to hide.
+  const substantive = new Set(["Amounts", "Dates", "Legal references", "Names", "Coverage"]);
+  const mustJudge = [
+    ...new Set(
+      deterministic.findings
+        .filter(
+          (f) =>
+            f.blockId &&
+            (f.severity === "critical" || (f.severity === "major" && substantive.has(f.category))),
+        )
+        .map((f) => f.blockId as string),
+    ),
+  ];
+  const judge = await runJudge(llm, verifyInput, {
+    signal: opts.signal,
+    model: config.llm.judgeModel || undefined,
+    fastModel: config.llm.judgeFastModel || undefined,
+    budgetMs: config.llm.judgeBudgetMs,
+    mustJudge,
+  });
 
-  const targetByBlock = new Map<string, string>();
-  for (const block of prepared.blocks) {
-    targetByBlock.set(block.id, "");
-  }
-  for (const seg of translated) {
-    targetByBlock.set(seg.blockId, joinTarget(targetByBlock.get(seg.blockId), seg.target));
-  }
-
-  const verification = await verifyDocument(
-    llm,
-    {
-      sourceTexts,
-      blockIds,
-      pageNumbers,
-      translated,
-      targetByBlock,
-      docType: prepared.detection.type,
-      meanOcrConfidence: prepared.meanOcrConfidence,
-    },
-    { signal: opts.signal, judgeModel: config.llm.judgeModel || undefined },
-  );
+  const verification = finalizeVerification(deterministic, judge, verifyInput);
 
   warnings.push(...verification.warnings);
   persistVerification(opts.documentId, verification);
 
   // ── Report ─────────────────────────────────────────────────────────────────
-  report("reported", "Generating report", 90);
+  report("reported", "Preparing report", 92);
 
-  const reportInput = makeReportInput(opts, prepared, verification, llm, sha256, translated.length, null);
-  const narrative = await generateNarrative(llm, reportInput);
-  const reportDoc = buildReport(reportInput, narrative);
+  const reportInput = makeReportInput(opts, prepared, verification, llm, sha256, translated.length);
+  // The narrative is a summary of numbers the pipeline already has. A model
+  // adds latency, not facts, so the deterministic narrative is the default and
+  // the model narrative is opt-in (NYD_REPORT_LLM=1).
+  const narrative = config.report.narrativeLlm
+    ? await generateNarrative(llm, reportInput)
+    : deterministicNarrative(reportInput);
+  const reportDoc = buildReport(reportInput, narrative, {
+    status: "final",
+    semanticAudit: judge.available ? (judge.complete ? "complete" : "partial") : "skipped",
+  });
   persistReport(opts.documentId, reportDoc);
 
   report("ready", "Complete", 100);
@@ -296,6 +351,28 @@ export async function runPipeline(opts: RunOptions): Promise<RunResult> {
   };
 }
 
+/** Group translated segments back into the block-level shape the verifier reads. */
+function buildVerifyInput(
+  prepared: ReturnType<typeof prepare>,
+  translated: TranslatedSegment[],
+): VerifyInput {
+  const targetByBlock = new Map<string, string>();
+  for (const block of prepared.blocks) targetByBlock.set(block.id, "");
+  for (const seg of translated) {
+    targetByBlock.set(seg.blockId, joinTarget(targetByBlock.get(seg.blockId), seg.target));
+  }
+
+  return {
+    sourceTexts: prepared.blocks.map((b) => b.sourceText),
+    blockIds: prepared.blocks.map((b) => b.id),
+    pageNumbers: prepared.blocks.map((b) => b.pageNumber),
+    translated,
+    targetByBlock,
+    docType: prepared.detection.type,
+    meanOcrConfidence: prepared.meanOcrConfidence,
+  };
+}
+
 function makeReportInput(
   opts: RunOptions,
   prepared: ReturnType<typeof prepare>,
@@ -303,7 +380,6 @@ function makeReportInput(
   llm: LlmClient,
   sha256: string,
   segmentCount: number,
-  narrative: Parameters<typeof buildReport>[1] | null,
 ): ReportInput {
   return {
     docId: opts.documentId,
@@ -561,6 +637,26 @@ function blockingReasons(v: VerificationResult): string[] {
   if (!v.judge.available) reasons.push("semantic verification did not run");
   else if (!v.judge.complete) reasons.push(`semantic verification covered ${v.judge.blocksJudged} of ${v.judge.blocksTotal} blocks`);
   return reasons;
+}
+
+/**
+ * Write the draft report without touching document status.
+ *
+ * The Word file is already downloadable at this point; this row is what lets
+ * the UI show a real report while the semantic pass is still running. The final
+ * report overwrites the same key.
+ */
+function persistDraftReport(documentId: string, report: VerificationReport): void {
+  const now = new Date().toISOString();
+  tx(() => {
+    run(
+      "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      `report:${documentId}`,
+      JSON.stringify(report),
+      now,
+    );
+    log(documentId, "reported", "draft report written (deterministic checks)");
+  });
 }
 
 function persistReport(documentId: string, report: VerificationReport): void {
