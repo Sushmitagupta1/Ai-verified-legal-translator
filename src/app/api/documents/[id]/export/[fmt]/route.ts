@@ -24,8 +24,7 @@ export async function GET(
   }
 
   const kindParam = new URL(req.url).searchParams.get("kind");
-  const kind: ExportKind =
-    kindParam === "translation" ? "translation" : kindParam === "tcr" ? "tcr" : "verification";
+  const kind: ExportKind = kindParam === "translation" ? "translation" : "verification";
 
   const document = get<{ file_name: string; company_name: string | null }>(
     `SELECT file_name, company_name FROM documents WHERE id = ?`,
@@ -58,8 +57,7 @@ export async function GET(
     const base = path
       .basename(document.file_name, path.extname(document.file_name))
       .replace(/[^\w.-]+/g, "_");
-    const suffix =
-      kind === "translation" ? "english-translation" : kind === "tcr" ? "title-clearance-report" : "verification-report";
+    const suffix = kind === "translation" ? "english-translation" : "title-clearance-report";
 
     return new NextResponse(new Uint8Array(bytes), {
       headers: {

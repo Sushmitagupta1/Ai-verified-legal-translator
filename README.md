@@ -140,16 +140,24 @@ NYD_LLM_MODEL=qwen2.5:14b
 ```bash
 # one-time setup
 curl -fsSL https://ollama.com/install.sh | sh   # Linux
-ollama pull qwen2.5:14b                          # ~9 GB
+ollama pull qwen2.5:7b                           # ~4.7 GB
 
-# the context window a local model gets. Ollama's default of 4096 is smaller
+# The context window a local model gets. Ollama's default of 4096 is smaller
 # than one translation prompt, and a truncated prompt produces a short,
 # off-schema reply - the whole chunk comes back untranslated.
-export OLLAMA_CONTEXT_LENGTH=16384
+#
+# On an 8 GiB GPU, 8192 context with a quantised KV cache leaves room for
+# several concurrent chunks. Match NYD_CONCURRENCY to OLLAMA_NUM_PARALLEL; if
+# the model spills to CPU, lower both.
+export OLLAMA_CONTEXT_LENGTH=8192
+export OLLAMA_NUM_PARALLEL=4
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
 
 # run the pipeline
 export NYD_LLM_PROVIDER=ollama
-export NYD_LLM_MODEL=gemma3:12b
+export NYD_LLM_MODEL=qwen2.5:7b
+export NYD_CONCURRENCY=4
 npx tsx scripts/probe-pipeline.ts
 ```
 
@@ -169,15 +177,51 @@ empty or far-too-short answer, or identical English for two different sources):
 
 ```bash
 export NYD_LLM_MODEL=qwen2.5:7b          # first pass: fast
-export NYD_LLM_REPAIR_MODEL=gemma3:12b   # second opinion for flagged segments
-export NYD_JUDGE_MODEL=gemma3:12b        # audit and report
+export NYD_LLM_REPAIR_MODEL=qwen2.5:7b   # second opinion for flagged segments
+export NYD_JUDGE_FAST_MODEL=qwen2.5:7b   # screen every block
+export NYD_JUDGE_MODEL=qwen2.5:7b        # escalated blocks and report
 ```
+
+On a small GPU the second opinion must fit in the same memory as the first
+pass. A 12B model is 8.2 GB on an 8 GiB card: it spills to CPU, and the
+"second opinion" then takes longer than the translation it is checking. The
+7B model keeps the pass on the GPU. A 12B repair model is worth using only
+when it fits alongside the configured parallelism (12 GiB or more); do not run
+it concurrently with four 7B slots.
 
 The second opinion runs after the translation is written, adopts an answer only
 when it removes a flag, and is bounded by a segment cap and a wall-clock budget.
 It also replaces the fast model's own pass over half-translated segments; if it
 stops early, that pass runs as a fallback. Leave `NYD_LLM_REPAIR_MODEL` empty to
 disable it and use a single model for everything.
+
+Up to `NYD_LLM_REPAIR_CONCURRENCY` second-opinion requests are prefetched at
+once, but their answers are adopted in batch order, so duplicate detection sees
+the same document state a one-at-a-time run would see. Keep it at `1` on a single
+GPU: four concurrent 7B repair requests run about four times slower each and are
+more likely to abort into a repetition loop. A segment that still has no English
+after every retry is never exported as an empty paragraph: Latin content already
+in the source (receipt numbers, stamp text) is preserved, otherwise an explicit
+marker is written and reported as `structure.translation_missing`.
+
+Measured on the 23-page sale deed (209 segments, RTX 5050 8 GiB, `qwen2.5:7b`
+for all four roles, `NYD_CONCURRENCY=4`):
+
+| Stage | Time |
+|---|---|
+| Extract (text layer + OCR fallback) | 17.9 s |
+| Translate, including second opinion | 401.6 s |
+| Semantic audit (bounded) | 107.2 s |
+| **Word file + draft report** | **424.7 s (7.1 min)** |
+| **Final report** | **530.7 s (8.8 min)** |
+
+That run produced 289 findings (48 critical), fidelity 0.649 (data 0.699,
+terminology 0.967, coverage 1.000, semantic 0.196) and no empty blocks. The
+meaning-level review covered 29 of 45 blocks inside its budget; the footer of the
+report says so. A second-opinion prefetch experiment with four repair requests
+in flight was *slower* (490 s of repair instead of 168 s) because the GPU
+serialised them and the model aborted into repetition loops, so repair
+concurrency defaults to 1.
 
 ### A report that arrives with the file, not ten minutes later
 
@@ -191,7 +235,8 @@ That audit is two-tier:
 1. A small model (`NYD_JUDGE_FAST_MODEL`, e.g. `qwen2.5:7b`) screens every block.
 2. Only blocks it marks unfaithful, is unsure about (below
    `NYD_JUDGE_ESCALATE_BELOW`), or failed to answer are re-asked of the strong
-   judge (`NYD_JUDGE_MODEL`, e.g. `gemma3:12b`).
+   judge (`NYD_JUDGE_MODEL`). On an 8 GiB GPU the strong judge is also a 7B
+   model; use a 12B only when it fits without spilling to CPU.
 
 The whole pass is bounded by `NYD_JUDGE_BUDGET_MS` (4 minutes by default). Any
 block not judged inside that window is reported as partial coverage rather than
@@ -212,11 +257,12 @@ written in milliseconds and says the same thing a model would; set
 > they produce more findings than a hosted model. Budget human review
 > accordingly.
 
-> **One model at a time on one GPU.** `NYD_CONCURRENCY` defaults to `1` for this
-> reason. Ollama serves a second request only by sharing the same GPU, so
-> parallel chunks each run proportionally slower and are the first to cross the
-> per-request timeout — which cancels them mid-generation and leaves their
-> segments untranslated. Raise the setting only for a hosted API.
+> **Parallel slots, not one model at a time.** Ollama serves several requests
+> concurrently when `OLLAMA_NUM_PARALLEL` and its context budget allow it. On an
+> 8 GiB card, four 7B slots at 8192 context with a q8 KV cache fit; set
+> `NYD_CONCURRENCY=4` to use them. If a larger model is configured, or the GPU
+> starts evicting layers to CPU, set both to `1` — parallel chunks then only
+> make each other slower and are the first to cross the per-request timeout.
 
 ### All variables
 
@@ -231,9 +277,10 @@ written in milliseconds and says the same thing a model would; set
 | `NYD_LLM_RETRIES` | `4` | Retry attempts with exponential backoff |
 | `NYD_LLM_TIMEOUT_MS` | `600000` | Per-request timeout; must outlast one translation chunk on a local model |
 | `NYD_JUDGE_MODEL` | *(same as model)* | Use a stronger model for the semantic pass |
-| `NYD_LLM_REPAIR_MODEL` | *(empty — disabled)* | Stronger model that re-asks only the segments the first pass got wrong |
+| `NYD_LLM_REPAIR_MODEL` | *(empty — disabled)* | Second-opinion model that re-asks only the segments the first pass got wrong; use a model that fits on the GPU |
 | `NYD_LLM_REPAIR_SEGMENTS` | `48` | Hard cap on flagged segments re-asked per document |
 | `NYD_LLM_REPAIR_BATCH` | `8` | Flagged segments per second-opinion request |
+| `NYD_LLM_REPAIR_CONCURRENCY` | `1` | Second-opinion requests in flight; keep at 1 on a single GPU |
 | `NYD_LLM_REPAIR_BUDGET_MS` | `360000` | Wall-clock budget for the whole second-opinion pass |
 | `NYD_JUDGE_FAST_MODEL` | *(empty)* | Small model that screens every block before the strong judge; leave empty for single-model judging |
 | `NYD_JUDGE_FAST_BATCH` | `12` | Blocks per fast-screen request |
@@ -244,7 +291,7 @@ written in milliseconds and says the same thing a model would; set
 | `NYD_REPORT_LLM` | `0` | Set to `1` to write the report narrative with a model instead of deterministically |
 | `NYD_QUEUE_CONCURRENCY` | `1` | Document jobs allowed to run at once; extra uploads wait in a visible queue |
 | `NYD_JOB_TIMEOUT_MS` | `10800000` | Hard stop for a single run so a stuck model cannot pin a queue slot |
-| `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; raise it for hosted providers, leave it at 1 for a local model on one GPU |
+| `NYD_CONCURRENCY` | `1` | Parallel model calls inside one document job; match it to `OLLAMA_NUM_PARALLEL` (e.g. `4`) when the model fits several GPU slots |
 | **Chunking** | | |
 | `NYD_CHUNK_TOKENS` | `1400` | Target tokens per translation chunk; a local model on one GPU does better with a smaller chunk than the budget allows |
 | `NYD_CHUNK_MAX_SEGMENTS` | `14` | Max segments per chunk; bounds output size, which a token budget on the source alone does not |
@@ -261,6 +308,7 @@ written in milliseconds and says the same thing a model would; set
 | `NYD_OCR_PAGE_REVIEW` | `0.8` | Per-page threshold marking a page "needs source review" |
 | `NYD_RENDER_DPI` | `300` | DPI used when rasterising a scanned page |
 | `NYD_MAX_DPI` | `400` | Upper bound on the above |
+| `NYD_OCR_CONCURRENCY` | `2` | Scanned pages OCR'd at once; raise for a multi-core host, lower for a shared OCR service |
 
 ---
 
@@ -274,9 +322,11 @@ wants to audit a run, but nothing in the main flow asks for them.
 ```bash
 export NYD_LLM_PROVIDER=ollama
 export NYD_LLM_MODEL=qwen2.5:7b
-export NYD_LLM_REPAIR_MODEL=gemma3:12b
-export NYD_JUDGE_MODEL=gemma3:12b
+export NYD_LLM_REPAIR_MODEL=qwen2.5:7b
+export NYD_JUDGE_MODEL=qwen2.5:7b
 export NYD_JUDGE_FAST_MODEL=qwen2.5:7b
+export NYD_CONCURRENCY=4
+export NYD_OCR_CONCURRENCY=3
 npm run dev        # http://localhost:3100
 ```
 
@@ -289,7 +339,7 @@ npm run dev        # http://localhost:3100
 | `POST /api/documents/:id/cancel` | Cancel a queued or running job; anything already written is kept |
 | `GET /api/documents/:id/timings` | Stage-by-stage durations for the run |
 | `GET /api/documents/:id/word` | The deliverable: the English translation as an editable `.docx` |
-| `GET /api/documents/:id/export/:fmt` | Report, translation or TCR as `txt`, `pdf` or `docx` (`?kind=`) |
+| `GET /api/documents/:id/export/:fmt` | Title-clearance report or clean translation as `txt`, `pdf` or `docx` (`?kind=translation` for the translation; the default is the report) |
 | `GET /api/health` | Provider, judge/repair models, narrative mode, queue depth and OCR backend |
 
 Jobs run outside the request: `POST .../run` returns `202` immediately, progress
@@ -297,11 +347,11 @@ is written to the `jobs` table, and the page polls until the pipeline finishes.
 The Word file is handed over as soon as the translation is committed to disk —
 a draft report is written at the same moment, and the final report follows the
 bounded semantic pass. The deliverable never waits for the audit. On the 23-page
-benchmark (209 source segments, one 12B GPU) the Word file and draft report
-arrived together at about 16 minutes, and the final report followed 4 minutes
-later; the audit stops at its budget and reports what it covered. A run produces
-one ordered target segment per source segment, so the segment list on the review
-page is the alignment, not a summary of it.
+benchmark (209 source segments, 45 blocks, 7B models on an 8 GiB RTX 5050) the
+Word file and draft report arrived together at about 7 minutes, and the final
+report followed under 2 minutes later; the audit stops at its budget and reports
+what it covered. A run produces one ordered target segment per source segment, so
+the segment list on the review page is the alignment, not a summary of it.
 
 Uploads beyond the first wait in an in-process queue with a visible position, so
 two people do not halve each other's GPU throughput. The document page shows each

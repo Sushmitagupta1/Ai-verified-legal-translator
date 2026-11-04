@@ -232,7 +232,11 @@ describe("segments returned empty by the model", () => {
 
     const outcome = await translateSegments(llm, segments, { docType: "property_document" });
 
-    expect(outcome.segments.map((s) => s.target)).toEqual(["", ""]);
+    // Empty blocks are worse than an explicit marker: the export must never
+    // contain a blank paragraph where a page of the deed used to be.
+    expect(outcome.segments.map((s) => s.target.length > 0)).toEqual([true, true]);
+    expect(outcome.segments.every((s) => !/[\u0A80-\u0AFF]/.test(s.target))).toBe(true);
+    expect(outcome.segments.every((s) => s.notes?.includes("No English translation was produced; source text preserved."))).toBe(true);
     expect(outcome.warnings.some((w) => w.includes("empty English text"))).toBe(true);
     expect(outcome.warnings.some((w) => w.includes("Segment 0 was not returned"))).toBe(false);
   });
@@ -358,7 +362,8 @@ describe("a translation chunk that cannot be translated", () => {
 
     const outcome = await translateSegments(llm, segments, { docType: "property_document" });
 
-    expect(outcome.segments.map((s) => s.target)).toEqual(["", ""]);
+    expect(outcome.segments.map((s) => s.target.length > 0)).toEqual([true, true]);
+    expect(outcome.segments.every((s) => !/[\u0A80-\u0AFF]/.test(s.target))).toBe(true);
     expect(outcome.segments.every((s) => (s.notes ?? []).join(" ").includes("OMISSION"))).toBe(true);
     expect(outcome.warnings.some((w) => w.includes("chunk failed"))).toBe(true);
   });

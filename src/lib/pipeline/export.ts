@@ -3,11 +3,12 @@ import path from "node:path";
 import type PDFKitType from "pdfkit";
 import { config, ensureDirs } from "../config";
 import { DISCLAIMER } from "../domain/glossary";
-import { normalizeWhitespace, transliterateGujarati } from "../domain/gujarati";
+import { normalizeWhitespace } from "../domain/gujarati";
 import { detectReportPattern, patternHeader, patternParts, type PatternPart, type ReportPattern } from "../domain/letterhead";
 import type { Block, Finding } from "../domain";
 import type { VerificationReport } from "./report";
-import { buildTcrItems, extractTcr, type TcrFooter, type TcrItem } from "./tcr";
+import { extractTcr, type TcrItem } from "./tcr";
+import { buildTcrReportItems } from "./tcrReport";
 import type { IBordersOptions } from "docx";
 
 export interface ExportInput {
@@ -38,7 +39,7 @@ function requireReport(input: ExportInput): VerificationReport {
 }
 
 /** Which document is being produced: the review report, the clean translation, or the Title Clearance Report. */
-export type ExportKind = "verification" | "translation" | "tcr";
+export type ExportKind = "verification" | "translation";
 
 type RenderRole = "h1" | "h2" | "p";
 
@@ -113,103 +114,31 @@ function reportStatusLine(report: VerificationReport): string {
   return `${status} · meaning-level review ${audit}`;
 }
 
-const SEVERITY_MARK: Record<string, string> = {
-  critical: "[CRITICAL]",
-  major: "[MAJOR]",
-  minor: "[MINOR]",
-  info: "[INFO]",
-};
-
 // ── Plain text ───────────────────────────────────────────────────────────────
 
+/**
+ * The audit report, rendered as the advocate's title-clearance report.
+ *
+ * The numbered legal sections, the certificate and the signature block follow
+ * the report pattern a bank receives from an advocate. The automated
+ * verification is folded into that structure: each finding is attached to the
+ * paragraph it affects, the adverse remarks sit in paragraph 18, and the full
+ * register is annexed so nothing the machine found is lost.
+ */
 export function buildTextExport(input: ExportInput): string {
-  const { blocks } = input;
+  return renderTcrText(reportItems(input));
+}
+
+function reportItems(input: ExportInput): TcrItem[] {
   const report = requireReport(input);
-  const out: string[] = [];
-
-  // Address the report the way the source document is addressed: its own
-  // letterhead and title, then "To, / The Manager, / <company>".
-  const header = headerOf(input, "source");
-  out.push(...header);
-  if (header.length) {
-    out.push("=".repeat(78));
-  }
-
-  out.push("VERIFICATION REPORT — GUJARATI → ENGLISH LEGAL TRANSLATION");
-  out.push("=".repeat(78));
-  out.push(`Source file          : ${input.fileName}`);
-  out.push(`Document type        : ${report.docTypeLabel}`);
-  out.push(`Pages                : ${report.pageCount}`);
-  out.push(`Translation segments : ${report.segmentCount}`);
-  out.push(`Translation provider : ${report.provider}`);
-  out.push(`Source SHA-256       : ${report.sourceSha256}`);
-  out.push(`Report generated     : ${report.generatedAt}`);
-  out.push(`Report status        : ${reportStatusLine(report)}`);
-  out.push("");
-  out.push(`Automated quality indicator : ${(report.fidelityIndicator.value * 100).toFixed(1)}% (${report.fidelityIndicator.grade.toUpperCase()})`);
-  out.push(`Certification status        : NOT CERTIFIED — human review required`);
-  out.push("");
-  out.push(DISCLAIMER);
-  out.push("");
-  out.push("AUTOMATED CHECKS PERFORMED");
-  out.push("-".repeat(78));
-  for (const c of report.mechanicalChecks) {
-    out.push(`[${c.passed ? "PASS" : "FLAG"}] ${c.check} (${c.count} item(s))`);
-    out.push(`       ${c.description}`);
-  }
-  out.push("");
-
-  if (report.findings.length > 0) {
-    out.push(`FINDINGS (${report.findings.length})`);
-    out.push("-".repeat(78));
-    for (const f of report.findings) {
-      out.push(`${SEVERITY_MARK[f.severity] ?? "[?]"} ${f.title}`);
-      out.push(`  Location  : ${f.location}`);
-      out.push(`  Check     : ${f.check}`);
-      out.push(`  Detail    : ${f.detail}`);
-      out.push(`  Action    : ${f.suggestion}`);
-      if (f.sourceExcerpt) out.push(`  Gujarati  : ${f.sourceExcerpt}`);
-      if (f.targetExcerpt) out.push(`  English   : ${f.targetExcerpt}`);
-      out.push("");
-    }
-  } else {
-    out.push("No findings were raised by the automated checks.");
-    out.push("");
-  }
-
-  out.push("SIDE-BY-SIDE TRANSLATION");
-  out.push("-".repeat(78));
-  for (const b of blocks) {
-    const blockFindings = input.findingsByBlock?.get(b.id) ?? [];
-    out.push("");
-    out.push(`[Page ${b.pageNumber} | ${b.kind} | ${b.id}]`);
-    out.push(`GUJARATI: ${b.sourceText}`);
-    out.push(`ENGLISH : ${b.targetText || "(no translation)"}`);
-    if (blockFindings.length > 0) {
-      out.push(`FINDINGS : ${blockFindings.map((f) => SEVERITY_MARK[f.severity] ?? "").filter(Boolean).join(" ")}`);
-      for (const f of blockFindings) out.push(`  - ${f.title}`);
-    }
-  }
-
-  out.push("");
-  out.push("=".repeat(78));
-  out.push("CERTIFICATION (to be completed by a qualified translator)");
-  out.push("-".repeat(78));
-  const hc = report.humanCertification;
-  out.push(`Certified translator   : ${hc.certifierName || "____________________________"}`);
-  out.push(`Qualifications         : ${hc.qualifications || "____________________________"}`);
-  out.push(`Registration number    : ${hc.registrationNumber || "____________________________"}`);
-  out.push(`Place                  : ${hc.place || "____________________________"}`);
-  out.push(`Date                   : ${hc.date || "____________________________"}`);
-  out.push(`Signature              : ${hc.signature || "____________________________"}`);
-  out.push("");
-  out.push(
-    "Signature of this block indicates that the translator has compared this translation " +
-      "against the original Gujarati document and accepts responsibility for its accuracy.",
-  );
-  out.push("");
-
-  return out.join("\n");
+  const generated = new Date(report.generatedAt);
+  return buildTcrReportItems({
+    data: extractTcr(input.blocks, input.companyName ?? ""),
+    report,
+    blocks: input.blocks,
+    companyName: input.companyName,
+    generatedAt: Number.isNaN(generated.getTime()) ? new Date() : generated,
+  });
 }
 
 // ── Clean translation ────────────────────────────────────────────────────────
@@ -270,148 +199,7 @@ export function buildTranslationText(input: ExportInput): string {
  * the compromise, and it is stated in the export itself.
  */
 export async function buildPdfExport(input: ExportInput): Promise<Buffer> {
-  const report = requireReport(input);
-  const PDFDocument = (await import("pdfkit")).default;
-  ensureDirs();
-
-  const doc = new PDFDocument({ size: "A4", margin: 42, bufferPages: true, info: { Title: "Verification Report" } });
-  const chunks: Buffer[] = [];
-  doc.on("data", (c: Buffer) => chunks.push(c));
-
-  const W = doc.page.width - 84;
-
-  const header = partsOf(input, "source");
-  if (header.length) {
-    drawPatternHeader(doc, header, W);
-    doc
-      .moveTo(doc.page.margins.left, doc.y)
-      .lineTo(doc.page.width - doc.page.margins.right, doc.y)
-      .strokeColor("#000")
-      .stroke();
-    doc.moveDown(0.6);
-  }
-
-  doc.font("Helvetica-Bold").fontSize(15).text("VERIFICATION REPORT", { align: "center" });
-  doc.moveDown(0.2);
-  doc
-    .font("Helvetica")
-    .fontSize(8.5)
-    .fillColor("#444")
-    .text("Gujarati → English legal translation — automated verification and human review", { align: "center" });
-  doc.moveDown(0.8);
-
-  const meta: Array<[string, string]> = [
-    ["Source file", input.fileName],
-    ["Document type", report.docTypeLabel],
-    ["Pages", String(report.pageCount)],
-    ["Translation segments", String(report.segmentCount)],
-    ["Translation provider", report.provider],
-    ["Source SHA-256", report.sourceSha256],
-    ["Report generated", report.generatedAt],
-    ["Report status", reportStatusLine(report)],
-  ];
-  for (const [k, v] of meta) {
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#000").text(`${k}: `, { continued: true });
-    doc.font("Helvetica").fillColor("#222").text(v);
-  }
-
-  doc.moveDown(0.6);
-  const ind = report.fidelityIndicator;
-  doc
-    .font("Helvetica-Bold")
-    .fontSize(11)
-    .fillColor(ind.grade === "green" ? "#166534" : ind.grade === "yellow" ? "#92400e" : "#991b1b")
-    .text(`Automated quality indicator: ${(ind.value * 100).toFixed(1)}% (${ind.grade.toUpperCase()}) — NOT CERTIFIED`, {
-      align: "center",
-    });
-  doc.moveDown(0.3);
-  doc.font("Helvetica").fontSize(8.5).fillColor("#444").text(ind.interpretation, { align: "center", width: W });
-  doc.moveDown(0.5);
-  doc.font("Helvetica-Oblique").fontSize(8.5).fillColor("#333").text(DISCLAIMER, { width: W, align: "center" });
-
-  doc.addPage();
-  sectionTitle(doc, "AUTOMATED CHECKS PERFORMED");
-  for (const c of report.mechanicalChecks) {
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(c.passed ? "#166534" : "#991b1b").text(`${c.passed ? "PASS" : "FLAG"} — ${c.check} (${c.count})`);
-    doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(c.description, { width: W - 10 });
-    doc.moveDown(0.35);
-  }
-
-  if (report.findings.length > 0) {
-    doc.addPage();
-    sectionTitle(doc, `FINDINGS (${report.findings.length})`);
-    for (const f of report.findings) {
-      if (doc.y > doc.page.height - 150) doc.addPage();
-      const color = f.severity === "critical" ? "#991b1b" : f.severity === "major" ? "#92400e" : "#444";
-      doc.font("Helvetica-Bold").fontSize(9.5).fillColor(color).text(`${f.severity.toUpperCase()} — ${f.title}`);
-      doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(`${f.location} · ${f.check}`, { width: W });
-      doc.font("Helvetica").fontSize(8.5).fillColor("#111").text(f.detail, { width: W });
-      doc.font("Helvetica-Oblique").fontSize(8.5).fillColor("#444").text(`Action: ${f.suggestion}`, { width: W });
-      if (f.sourceExcerpt) {
-        doc.font("Helvetica").fontSize(8).fillColor("#555").text(`Gujarati: ${romanise(f.sourceExcerpt)}`, { width: W });
-      }
-      if (f.targetExcerpt) {
-        doc.font("Helvetica").fontSize(8).fillColor("#555").text(`English: ${f.targetExcerpt}`, { width: W });
-      }
-      doc.moveDown(0.6);
-      doc.moveTo(doc.page.margins.left, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor("#e5e5e5").stroke();
-      doc.moveDown(0.5);
-    }
-  }
-
-  doc.addPage();
-  sectionTitle(doc, "SIDE-BY-SIDE TRANSLATION");
-  doc.font("Helvetica-Oblique").fontSize(8).fillColor("#666").text(
-    "Gujarati source is romanised in this PDF because the embedded font does not support Gujarati script. " +
-      "Confirm against the original using the SHA-256 above before relying on any block.",
-    { width: W },
-  );
-  doc.moveDown(0.5);
-
-  for (const b of input.blocks) {
-    if (doc.y > doc.page.height - 140) doc.addPage();
-    const bf = input.findingsByBlock?.get(b.id) ?? [];
-    const hasFinding = bf.some((f) => f.severity === "critical" || f.severity === "major");
-
-    doc
-      .font("Helvetica-Bold")
-      .fontSize(8.5)
-      .fillColor(hasFinding ? "#991b1b" : "#333")
-      .text(`Page ${b.pageNumber} · ${b.kind.replace(/_/g, " ")}${hasFinding ? "  ⚑ findings" : ""}`);
-
-    doc.font("Helvetica").fontSize(9).fillColor("#111").text(normalizeWhitespace(b.targetText || "(no translation)"), { width: W });
-    doc.font("Helvetica").fontSize(7.5).fillColor("#777").text(`Gujarati: ${romanise(normalizeWhitespace(b.sourceText))}`, { width: W });
-    doc.moveDown(0.6);
-  }
-
-  doc.addPage();
-  sectionTitle(doc, "CERTIFICATION");
-  doc.font("Helvetica").fontSize(8.5).fillColor("#444").text(
-    "This block is to be completed and signed by a qualified legal translator who has compared this translation " +
-      "against the original Gujarati document. Until it is signed, this document is an unverified machine draft.",
-    { width: W },
-  );
-  doc.moveDown(1);
-  for (const label of ["Certified translator", "Qualifications", "Registration number", "Place", "Date", "Signature"]) {
-    doc.font("Helvetica-Bold").fontSize(9).fillColor("#000").text(`${label}:`);
-    doc.moveDown(0.2).moveTo(200, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor("#999").stroke();
-    doc.moveDown(0.7);
-  }
-
-  const range = doc.bufferedPageRange();
-  for (let i = 0; i < range.count; i++) {
-    doc.switchToPage(range.start + i);
-    doc
-      .font("Helvetica")
-      .fontSize(7.5)
-      .fillColor("#888")
-      .text(`Page ${i + 1} of ${range.count}`, doc.page.width - 140, doc.page.height - 40, { width: 100, align: "right" });
-    doc.text("Nyayadoot — AI translation, not certified", doc.page.margins.left, doc.page.height - 40, { width: 260, align: "left" });
-  }
-
-  doc.end();
-  await new Promise<void>((resolve) => doc.on("end", resolve));
-  return Buffer.concat(chunks);
+  return renderTcrPdf(reportItems(input), "Title Clearance Report");
 }
 
 /**
@@ -530,190 +318,10 @@ function drawPatternHeader(doc: InstanceType<typeof PDFKitType>, parts: PatternP
   if (parts.length) doc.moveDown(0.6);
 }
 
-function sectionTitle(doc: InstanceType<typeof PDFKitType>, title: string): void {
-  doc.font("Helvetica-Bold").fontSize(13).fillColor("#000").text(title);
-  doc.moveDown(0.2);
-  doc.moveTo(doc.page.margins.left, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor("#000").stroke();
-  doc.moveDown(0.6);
-}
-
-/**
- * Render Gujarati as readable Latin for the PDF/DOCX columns.
- *
- * Not a substitute for the original: the transliteration is approximate and is
- * labelled as such wherever it appears. It exists so a reviewer without the
- * Gujarati source in front of them can still follow which block is being discussed.
- */
-function romanise(s: string): string {
-  return transliterateGujarati(s) || s;
-}
-
 // ── DOCX ─────────────────────────────────────────────────────────────────────
 
 export async function buildDocxExport(input: ExportInput): Promise<Buffer> {
-  const report = requireReport(input);
-  const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, AlignmentType } =
-    (await import("docx")) as typeof import("docx");
-
-  ensureDirs();
-
-  const ind = report.fidelityIndicator;
-  // A docx body is a flat list of block-level items, so headings/paragraphs
-  // share the array with tables; `File` accepts either.
-  const children: Array<InstanceType<typeof Paragraph> | InstanceType<typeof Table>> = [];
-
-  const masthead = partsOf(input, "source");
-  masthead.forEach((p, i) => {
-    if (p.kind === "letterhead") {
-      children.push(
-        new Paragraph({
-          alignment: AlignmentType.CENTER,
-          children: [new TextRun({ text: p.text, bold: i === 0, size: i === 0 ? 24 : 18 })],
-        }),
-      );
-    } else if (p.kind === "title") {
-      children.push(
-        new Paragraph({
-          alignment: AlignmentType.CENTER,
-          spacing: { before: 160 },
-          children: [new TextRun({ text: p.text.toUpperCase(), bold: true, size: 26 })],
-        }),
-      );
-    } else {
-      children.push(new Paragraph({ children: [new TextRun({ text: p.text, size: 20 })] }));
-    }
-  });
-  if (masthead.length) {
-    children.push(new Paragraph({ spacing: { before: 200, after: 120 }, children: [] }));
-  }
-
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      heading: HeadingLevel.HEADING_1,
-      children: [new TextRun({ text: "Verification Report", bold: true })],
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [new TextRun({ text: "Gujarati → English legal translation — automated verification and human review", italics: true, size: 18 })],
-    }),
-  );
-
-  const rows: Array<[string, string]> = [
-    ["Source file", input.fileName],
-    ["Document type", report.docTypeLabel],
-    ["Pages", String(report.pageCount)],
-    ["Translation segments", String(report.segmentCount)],
-    ["Translation provider", report.provider],
-    ["Source SHA-256", report.sourceSha256],
-    ["Report generated", report.generatedAt],
-    ["Report status", reportStatusLine(report)],
-    ["Automated quality indicator", `${(ind.value * 100).toFixed(1)}% (${ind.grade.toUpperCase()}) — NOT CERTIFIED`],
-  ];
-
-  children.push(
-    new Table({
-      width: { size: 100, type: WidthType.PERCENTAGE },
-      rows: rows.map(
-        ([k, v]) =>
-          new TableRow({
-            children: [
-              new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: k, bold: true, size: 18 })] })], width: { size: 32, type: WidthType.PERCENTAGE } }),
-              new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: v, size: 18 })] })] }),
-            ],
-          }),
-      ),
-    }),
-  );
-
-  children.push(
-    new Paragraph({ children: [new TextRun({ text: DISCLAIMER, italics: true, size: 16, color: "666666" })] }),
-  );
-
-  children.push(new Paragraph({ text: "Automated checks performed", heading: HeadingLevel.HEADING_2 }));
-  for (const c of report.mechanicalChecks) {
-    children.push(
-      new Paragraph({
-        bullet: { level: 0 },
-        children: [
-          new TextRun({ text: `${c.passed ? "PASS" : "FLAG"} — ${c.check} (${c.count}): `, bold: true }),
-          new TextRun({ text: c.description }),
-        ],
-      }),
-    );
-  }
-
-  if (report.findings.length > 0) {
-    children.push(new Paragraph({ text: `Findings (${report.findings.length})`, heading: HeadingLevel.HEADING_2 }));
-    for (const f of report.findings) {
-      children.push(
-        new Paragraph({
-          children: [new TextRun({ text: `${f.severity.toUpperCase()} — ${f.title}`, bold: true })],
-        }),
-        new Paragraph({ children: [new TextRun({ text: `${f.location} · ${f.check}`, size: 16, color: "555555" })] }),
-        new Paragraph({ children: [new TextRun({ text: f.detail })] }),
-        new Paragraph({ children: [new TextRun({ text: `Action: ${f.suggestion}`, italics: true })] }),
-        ...(f.sourceExcerpt ? [new Paragraph({ children: [new TextRun({ text: `Gujarati: ${f.sourceExcerpt}`, size: 16, color: "555555" })] })] : []),
-        ...(f.targetExcerpt ? [new Paragraph({ children: [new TextRun({ text: `English: ${f.targetExcerpt}`, size: 16, color: "555555" })] })] : []),
-      );
-    }
-  }
-
-  children.push(
-    new Paragraph({ text: "Side-by-side translation", heading: HeadingLevel.HEADING_2 }),
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: "The Gujarati column is romanised because this document's font does not cover Gujarati script. Confirm against the original using the SHA-256 above.",
-          italics: true,
-          size: 16,
-          color: "666666",
-        }),
-      ],
-    }),
-  );
-
-  for (const b of input.blocks) {
-    const bf = input.findingsByBlock?.get(b.id) ?? [];
-    const flagged = bf.some((f) => f.severity === "critical" || f.severity === "major");
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({ text: `Page ${b.pageNumber} · ${b.kind.replace(/_/g, " ")}`, bold: true, size: 17, color: flagged ? "991B1B" : "333333" }),
-          ...(flagged ? [new TextRun({ text: "  ⚑ findings", bold: true, size: 17, color: "991B1B" })] : []),
-        ],
-      }),
-      new Paragraph({ children: [new TextRun({ text: b.targetText || "(no translation)" })] }),
-      new Paragraph({ children: [new TextRun({ text: `Gujarati: ${romanise(normalizeWhitespace(b.sourceText))}`, size: 15, color: "777777" })] }),
-    );
-  }
-
-  children.push(
-    new Paragraph({ text: "Certification", heading: HeadingLevel.HEADING_2 }),
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: "To be completed and signed by a qualified legal translator who has compared this translation against the original Gujarati document. Until signed, this is an unverified machine draft.",
-          italics: true,
-          size: 16,
-          color: "666666",
-        }),
-      ],
-    }),
-  );
-  for (const label of ["Certified translator", "Qualifications", "Registration number", "Place", "Date", "Signature"]) {
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({ text: `${label}: `, bold: true }),
-          new TextRun({ text: "______________________________________________", color: "999999" }),
-        ],
-      }),
-    );
-  }
-
-  const doc = new Document({ sections: [{ properties: {}, children }] });
-  return Packer.toBuffer(doc);
+  return renderTcrDocx(reportItems(input));
 }
 
 /**
@@ -1054,23 +662,16 @@ export async function buildTranslationDocx(input: ExportInput): Promise<Buffer> 
   return Packer.toBuffer(doc);
 }
 
-// ── Title Clearance Report ───────────────────────────────────────────────────
+// ── Title Clearance Report renderers ────────────────────────────────────────
 
-function tcrFooterOf(input: ExportInput): TcrFooter {
-  const r = requireReport(input);
-  return {
-    fidelity: indicatorLine(r),
-    docTypeLabel: r.docTypeLabel,
-    segmentCount: r.segmentCount,
-    disclaimer: DISCLAIMER,
-    sha: r.sourceSha256,
-    generatedAt: r.generatedAt,
-  };
+type TcrAlign = NonNullable<Extract<TcrItem, { t: "p" }>["align"]>;
+
+function tcrAlignment(a?: TcrAlign): "left" | "center" | "right" | "justify" {
+  return a ?? "left";
 }
 
-/** TCR as plain text (fallback format): each item rendered to lines. */
-export function buildTcrText(input: ExportInput): string {
-  const items = buildTcrItems(extractTcr(input.blocks, input.companyName ?? ""), tcrFooterOf(input));
+/** Render the report model as plain text (the .txt export). */
+function renderTcrText(items: TcrItem[]): string {
   const out: string[] = [];
   for (const it of items) {
     switch (it.t) {
@@ -1081,13 +682,11 @@ export function buildTcrText(input: ExportInput): string {
         out.push("", it.text, "=".repeat(Math.max(8, Math.min(78, it.text.length))), "");
         break;
       case "h2":
-        out.push("", it.text, "-".repeat(Math.max(8, Math.min(78, it.text.length))), "");
+        out.push("", it.text, "");
         break;
-      case "p": {
-        const t = it.text.replace(/\t/g, "  ");
-        out.push(t);
+      case "p":
+        out.push(it.text.replace(/\t/g, "  "));
         break;
-      }
       case "bullets":
         for (const b of it.items) out.push("•  " + b);
         out.push("");
@@ -1110,24 +709,16 @@ export function buildTcrText(input: ExportInput): string {
   return out.join("\n");
 }
 
-type TcrAlign = NonNullable<Extract<TcrItem, { t: "p" }>["align"]>;
-
-function tcrAlignment(a?: TcrAlign): "left" | "center" | "right" | "justify" {
-  return a ?? "left";
-}
-
-/** TCR as PDF via pdfkit: part 1 (report), part 2 (certificate), part 3 (search schedule). */
-export async function buildTcrPdf(input: ExportInput): Promise<Buffer> {
+/** Render the report model as PDF. */
+async function renderTcrPdf(items: TcrItem[], title: string): Promise<Buffer> {
   const PDFDocument = (await import("pdfkit")).default;
   ensureDirs();
 
-  const doc = new PDFDocument({ size: "A4", margin: 42, bufferPages: true, info: { Title: "Title Clearance Report" } });
+  const doc = new PDFDocument({ size: "A4", margin: 42, bufferPages: true, info: { Title: title } });
   const chunks: Buffer[] = [];
   doc.on("data", (c: Buffer) => chunks.push(c));
 
-  const items = buildTcrItems(extractTcr(input.blocks, input.companyName ?? ""), tcrFooterOf(input));
   const W = doc.page.width - 84;
-  const x0 = doc.page.margins.left;
 
   for (const it of items) {
     const align = it.t === "p" ? tcrAlignment(it.align) : "left";
@@ -1143,25 +734,26 @@ export async function buildTcrPdf(input: ExportInput): Promise<Buffer> {
         break;
       case "h2":
         if (doc.y > doc.page.height - 140) doc.addPage();
-        doc.moveDown(0.5);
-        doc.font("Helvetica-Bold").fontSize(11).text(it.text, { width: W });
-        doc.moveTo(x0, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor("#000").stroke();
-        doc.moveDown(0.5);
+        doc.moveDown(0.45);
+        doc.font("Helvetica-Bold").fontSize(10.5).fillColor("#000").text(it.text, { width: W });
+        doc.moveDown(0.25);
         break;
       case "p": {
-        if (doc.y > doc.page.height - 120) doc.addPage();
+        if (doc.y > doc.page.height - 110) doc.addPage();
         const t = it.text.replace(/\t/g, "      ");
+        const size = it.size ? it.size / 2 : it.italic ? 8.5 : it.bold ? 9.5 : 10;
         doc
-          .font(it.bold ? "Helvetica-Bold" : "Helvetica")
-          .fontSize(it.italic ? 8.5 : it.bold ? 9.5 : 10)
+          .font(it.bold ? "Helvetica-Bold" : it.italic ? "Helvetica-Oblique" : "Helvetica")
+          .fontSize(size)
+          .fillColor("#000")
           .text(t, { width: W, align });
-        doc.moveDown(0.25);
+        doc.moveDown(0.2);
         break;
       }
       case "bullets":
         if (doc.y > doc.page.height - 160) doc.addPage();
         for (const b of it.items) {
-          if (doc.y > doc.page.height - 120) doc.addPage();
+          if (doc.y > doc.page.height - 110) doc.addPage();
           doc.font("Helvetica").fontSize(9.5).fillColor("#111").text("•  " + b, { width: W - 24, indent: 12 });
           doc.moveDown(0.2);
         }
@@ -1203,12 +795,17 @@ export async function buildTcrPdf(input: ExportInput): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-const TCR_COLS = [0.07, 0.16, 0.22, 0.15, 0.14, 0.15, 0.11];
-
-function drawTcrTable(doc: InstanceType<typeof PDFKitType>, header: string[], rows: Array<string[] & { length: number }>): void {
+function drawTcrTable(
+  doc: InstanceType<typeof PDFKitType>,
+  header: string[],
+  rows: Array<string[] & { length: number }>,
+): void {
   const W = doc.page.width - 84;
   const x0 = doc.page.margins.left;
-  const widths = TCR_COLS.map((p) => Math.floor(W * p));
+  // First column (check / label) gets more room; the rest share what is left.
+  const weights = header.map((_, i) => (i === 0 ? 1.5 : i === 2 && header.length > 3 ? 0.7 : 1));
+  const total = weights.reduce((a, b) => a + b, 0);
+  const widths = weights.map((w) => Math.floor((W * w) / total));
   const pad = 3;
 
   const drawRow = (cells: string[], opts: { bold: boolean }): void => {
@@ -1233,14 +830,13 @@ function drawTcrTable(doc: InstanceType<typeof PDFKitType>, header: string[], ro
   for (const row of rows) drawRow(row, { bold: false });
 }
 
-/** TCR as DOCX with real headings, a bordered boundaries table and a search schedule table. */
-export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
-  const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle } =
+/** Render the report model as DOCX on the advocate's letterhead stock. */
+async function renderTcrDocx(items: TcrItem[]): Promise<Buffer> {
+  const { Document, Packer, Paragraph, TextRun, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle } =
     (await import("docx")) as typeof import("docx");
 
   ensureDirs();
 
-  const items = buildTcrItems(extractTcr(input.blocks, input.companyName ?? ""), tcrFooterOf(input));
   const children: Array<InstanceType<typeof Paragraph> | InstanceType<typeof Table>> = [];
 
   type DocxAlign = (typeof AlignmentType)[keyof typeof AlignmentType];
@@ -1271,7 +867,7 @@ export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
       margins: { top: 80, bottom: 80, left: 100, right: 100 },
       children: [
         new Paragraph({
-          children: [new TextRun({ text, bold: opts.bold, italics: opts.italic, size: 18 })],
+          children: [new TextRun({ text, bold: opts.bold, italics: opts.italic, size: 17 })],
         }),
       ],
     });
@@ -1279,24 +875,22 @@ export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
   for (const it of items) {
     switch (it.t) {
       case "page":
-        children.push(new Paragraph({ children: [new TextRun({ text: "", break: 1 })], pageBreakBefore: true }));
+        children.push(new Paragraph({ pageBreakBefore: true, children: [] }));
         break;
       case "h1":
         children.push(
           new Paragraph({
             alignment: AlignmentType.CENTER,
-            heading: HeadingLevel.HEADING_1,
-            spacing: { before: 160, after: 160 },
-            children: [new TextRun({ text: it.text, bold: true })],
+            spacing: { before: 200, after: 200 },
+            children: [new TextRun({ text: it.text, bold: true, size: 32 })],
           }),
         );
         break;
       case "h2":
         children.push(
           new Paragraph({
-            heading: HeadingLevel.HEADING_2,
-            spacing: { before: 200, after: 120 },
-            children: [new TextRun({ text: it.text, bold: true })],
+            spacing: { before: 220, after: 80 },
+            children: [new TextRun({ text: it.text, bold: true, size: 22 })],
           }),
         );
         break;
@@ -1305,15 +899,22 @@ export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
         children.push(
           new Paragraph({
             alignment: alignOf(it.align),
-            spacing: { after: 80 },
-            children: [new TextRun({ text: t, bold: it.bold, italics: it.italic, size: 20 })],
+            spacing: { after: 80, line: 300 },
+            children: [new TextRun({ text: t, bold: it.bold, italics: it.italic, size: it.size ?? 20 })],
           }),
         );
         break;
       }
       case "bullets":
         for (const b of it.items) {
-          children.push(new Paragraph({ bullet: { level: 0 }, spacing: { after: 60 }, children: [new TextRun({ text: b, size: 19 })] }));
+          children.push(
+            new Paragraph({
+              bullet: { level: 0 },
+              alignment: AlignmentType.JUSTIFIED,
+              spacing: { after: 60, line: 300 },
+              children: [new TextRun({ text: b, size: 19 })],
+            }),
+          );
         }
         children.push(new Paragraph({ children: [] }));
         break;
@@ -1355,7 +956,27 @@ export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
     }
   }
 
-  const doc = new Document({ sections: [{ properties: {}, children }] });
+  const doc = new Document({
+    styles: {
+      default: {
+        document: {
+          run: { font: "Bookman Old Style", size: 20 },
+          paragraph: { spacing: { line: 300 } },
+        },
+      },
+    },
+    sections: [
+      {
+        properties: {
+          page: {
+            size: { width: 11907, height: 16839 },
+            margin: { top: 993, right: 1134, bottom: 1560, left: 1440, header: 720, footer: 720 },
+          },
+        },
+        children,
+      },
+    ],
+  });
   return Packer.toBuffer(doc);
 }
 
@@ -1364,9 +985,8 @@ export async function buildTcrDocx(input: ExportInput): Promise<Buffer> {
 export type ExportFormat = "pdf" | "docx" | "txt";
 
 const SUFFIX: Record<ExportKind, string> = {
-  verification: "verification-report",
+  verification: "title-clearance-report",
   translation: "english-translation",
-  tcr: "title-clearance-report",
 };
 
 export async function exportDocument(
@@ -1379,25 +999,22 @@ export async function exportDocument(
 
   const suffix = SUFFIX[kind];
   const wantsTranslation = kind === "translation";
-  const wantsTcr = kind === "tcr";
 
   if (format === "txt") {
     const p = path.join(config.exportDir, `${base}-${suffix}.txt`);
-    const body = wantsTcr ? buildTcrText(input) : wantsTranslation ? buildTranslationText(input) : buildTextExport(input);
+    const body = wantsTranslation ? buildTranslationText(input) : buildTextExport(input);
     fs.writeFileSync(p, body, "utf8");
     return { path: p, bytes: fs.statSync(p).size };
   }
 
   if (format === "pdf") {
-    const buf =
-      wantsTcr ? await buildTcrPdf(input) : wantsTranslation ? await buildTranslationPdf(input) : await buildPdfExport(input);
+    const buf = wantsTranslation ? await buildTranslationPdf(input) : await buildPdfExport(input);
     const p = path.join(config.exportDir, `${base}-${suffix}.pdf`);
     fs.writeFileSync(p, buf);
     return { path: p, bytes: buf.length };
   }
 
-  const buf =
-    wantsTcr ? await buildTcrDocx(input) : wantsTranslation ? await buildTranslationDocx(input) : await buildDocxExport(input);
+  const buf = wantsTranslation ? await buildTranslationDocx(input) : await buildDocxExport(input);
   const p = path.join(config.exportDir, `${base}-${suffix}.docx`);
   fs.writeFileSync(p, buf);
   return { path: p, bytes: buf.length };

@@ -249,8 +249,8 @@ describe("clean translation export", () => {
   });
 });
 
-describe("verification report adopts the same pattern", () => {
-  it("opens with the source letterhead and addressee", () => {
+describe("verification report adopts the title-clearance layout", () => {
+  it("opens with the advocate masthead, title and addressee", () => {
     const text = buildTextExport({
       docId: "d-test",
       fileName: "Dev Arcade-Kalol.docx",
@@ -259,13 +259,17 @@ describe("verification report adopts the same pattern", () => {
       companyName: "Kotak Mahindra Bank Limited",
     });
     const lines = text.split("\n");
-    expect(lines[0]).toBe("VISHAL M. KOTHARI");
+    // No advocate letterhead is configured, so the report prints a blank line
+    // for the Advocate to complete instead of attributing the opinion to the
+    // author of the source document.
+    expect(lines[0]).toBe("________________________________");
+    expect(lines).toContain("(Advocate)");
     expect(lines).toContain("TITLE CLEARANCE REPORT");
     expect(lines).toContain("Kotak Mahindra Bank Limited");
-    expect(text).toContain("VERIFICATION REPORT — GUJARATI → ENGLISH LEGAL TRANSLATION");
+    expect(text).not.toContain("VERIFICATION REPORT");
   });
 
-  it("still renders a plain report when the source has no pattern", () => {
+  it("renders the numbered title-clearance sections even when the source has no pattern", () => {
     n = 0;
     const text = buildTextExport({
       docId: "d-test",
@@ -273,7 +277,9 @@ describe("verification report adopts the same pattern", () => {
       blocks: [block("body", "Just a paragraph of source text with no header at all.")],
       report: report(),
     });
-    expect(text.startsWith("VERIFICATION REPORT")).toBe(true);
+    expect(text).toContain("TITLE CLEARANCE REPORT");
+    expect(text).toContain("1.  Name of the Owner/Mortgagor:");
+    expect(text).toContain("22.  Certificate on enforceability of the property under the Securitisation");
   });
 });
 

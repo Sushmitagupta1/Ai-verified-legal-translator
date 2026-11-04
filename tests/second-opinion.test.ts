@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assessTarget, lostNumbers, translateSegments } from "../src/lib/pipeline/translate";
+import { assessTarget, lastResortEnglish, lostNumbers, translateSegments } from "../src/lib/pipeline/translate";
 import type { Segment } from "../src/lib/pipeline/translate";
 
 function segments(sources: string[]): Segment[] {
@@ -334,5 +334,72 @@ describe("second-opinion pass", () => {
     });
 
     expect(calls).toBe(1);
+  });
+
+  it("overlaps repair requests while adopting their answers in batch order", async () => {
+    // Four independently flagged amounts, one per batch. With concurrency 2 the
+    // first two requests must be in flight together; the GPU slots Ollama
+    // exposes are otherwise unused and every batch waits its turn.
+    const sources = [
+      "કુલ રકમ 18080.00 ચૂકવવામાં આવી છે તેમ લખાય છે",
+      "ફી 500.00 ચૂકવવામાં આવી છે તેમ લખાય છે",
+      "રકમ 250.00 ચૂકવવામાં આવી છે તેમ લખાય છે",
+      "રકમ 100.00 ચૂકવવામાં આવી છે તેમ લખાય છે",
+    ];
+    const amounts: Record<number, string> = { 0: "18,080.00", 1: "500.00", 2: "250.00", 3: "100.00" };
+
+    let active = 0;
+    let maxActive = 0;
+    const llm = {
+      name: "fake",
+      model: "fast",
+      available: true,
+      complete: async (messages: Array<{ role: string; content: string }>) => {
+        const ids = idsInPrompt(messages);
+        if (isRepair(messages)) {
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          active -= 1;
+          return JSON.stringify({
+            segments: ids.map((id) => ({
+              id,
+              target: `The total amount of Rs. ${amounts[id]} has been paid, as stated.`,
+            })),
+          });
+        }
+        return JSON.stringify({
+          segments: ids.map((id) => ({ id, target: "The amount was paid, as stated herein." })),
+        });
+      },
+    };
+
+    const outcome = await translateSegments(llm, segments(sources), {
+      docType: "property_document",
+      repair: { model: "strong", maxSegments: 8, budgetMs: 60_000, batchSegments: 1, concurrency: 2 },
+    });
+
+    expect(maxActive).toBe(2);
+    for (const [index, amount] of Object.entries(amounts)) {
+      expect(outcome.segments.find((s) => s.index === Number(index))!.target).toContain(amount);
+    }
+    expect(outcome.warnings.some((w) => w.includes("replaced 4 of 4"))).toBe(true);
+  });
+});
+
+describe("lastResortEnglish", () => {
+  it("keeps usable Latin registration data and strips Gujarati labels", () => {
+    const text = lastResortEnglish(
+      "Application No (અરજી નેબર) 20231101802815 Printed On (છાપ્યા તારીખ) 19/10/2023",
+    );
+    expect(text).toContain("Application No");
+    expect(text).toContain("20231101802815");
+    expect(/[\u0A80-\u0AFF]/.test(text)).toBe(false);
+  });
+
+  it("prints an explicit marker when the source has no English to preserve", () => {
+    const text = lastResortEnglish("આ દસ્તાવેજની નોંધણી બાદ અસલ દસ્તાવેજ પરત કરવામાં આવશે");
+    expect(text).toContain("No English translation");
+    expect(/[\u0A80-\u0AFF]/.test(text)).toBe(false);
   });
 });

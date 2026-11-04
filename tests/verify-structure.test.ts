@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { verifyStructure, type VerifyInput } from "../src/lib/pipeline/verify";
-import type { TranslatedSegment } from "../src/lib/pipeline/translate";
+import { NO_TRANSLATION_MARKER, type TranslatedSegment } from "../src/lib/pipeline/translate";
 
 /**
  * Structure verification granularity.
@@ -71,5 +71,15 @@ describe("verifyStructure alignment granularity", () => {
     );
 
     expect(checks(input)).toEqual([]);
+  });
+
+  it("flags a fallback marker as an untranslated block, not a complete one", () => {
+    const input = makeInput(
+      ["A block the provider could not translate."],
+      [seg(0, "b1", "A block the provider could not translate.", NO_TRANSLATION_MARKER)],
+    );
+
+    expect(checks(input)).toContain("structure.translation_missing");
+    expect(checks(input)).not.toContain("structure.block_empty");
   });
 });

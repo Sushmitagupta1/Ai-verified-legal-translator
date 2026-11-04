@@ -80,6 +80,13 @@ describe("TCR extraction — full deed fixture", () => {
     ]);
   });
 
+  it("describes the property in grammatical English without borrowing adjectives", () => {
+    expect(d.propertyBody).toMatch(/^All that piece and parcel of immovable property bearing /);
+    expect(d.propertyBody).not.toContain("of, immovable");
+    expect(d.propertyBody).not.toMatch(/of\s+(,|\.)/);
+    expect(d.propertyBody).toContain("together with all rights, title and interest therein");
+  });
+
   it("recovers note numbers behind OCR letter confusions", () => {
     const joined = d.docs.join("\n") + "\n" + d.flow.join("\n");
     expect(joined).toContain("Note No. 1181");

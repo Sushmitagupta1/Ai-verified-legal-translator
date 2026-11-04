@@ -33,6 +33,8 @@ export interface TcrData {
   regFee: string;
   appNo: string;
   appDate: string;
+  deedNo: string;
+  deedDate: string;
   propertyBody: string;
   originalOwner: string;
   heir: string;
@@ -179,12 +181,52 @@ function extractBoundaries(text: string): TcrBoundary[] {
     .map((l) => out.find((b) => b.label === l) as TcrBoundary);
 }
 
+function describeProperty(p: {
+  text: string;
+  rsn: string;
+  oldBlock: string;
+  newBlock: string;
+  area: string;
+  khata: string;
+  village: string;
+  taluka: string;
+  district: string;
+  consideration: string;
+}): string {
+  const kind = /બિન\s*ખેતી|બિનખેતી|N\.?\s*A\.?\s*order/i.test(p.text)
+    ? "Non-Agricultural immovable property"
+    : "immovable property";
+  const identifiers: string[] = [];
+  if (p.rsn) identifiers.push(`Revenue Survey No. ${p.rsn}`);
+  if (p.oldBlock) identifiers.push(`old Block No. ${p.oldBlock}${p.newBlock ? ` (now new Block No. ${p.newBlock})` : ""}`);
+  else if (p.newBlock) identifiers.push(`Block No. ${p.newBlock}`);
+  if (p.khata) identifiers.push(`Khata No. ${p.khata}`);
+  const clauses: string[] = [];
+  if (identifiers.length) clauses.push(`bearing ${identifiers.join(", ")}`);
+  if (p.area) clauses.push(`admeasuring ${p.area}`);
+  const place: string[] = [];
+  if (p.village) place.push(`Village ${translit(p.village)}`);
+  if (p.taluka) place.push(`Sub-District ${p.taluka}`);
+  if (p.district) place.push(`District ${p.district}`);
+  if (place.length) clauses.push(`situate at ${place.join(", ")}`);
+  clauses.push("together with all rights, title and interest therein");
+  return (
+    `All that piece and parcel of ${kind} ${clauses.join(", ")}` +
+    (p.consideration ? `, and sold for a consideration of Rs. ${p.consideration}/-.` : ".")
+  );
+}
+
 export function extractTcr(blocks: Block[], companyName: string): TcrData {
   const raw = fullText(blocks);
   const text = ascii(raw);
 
   const addressee = clean(companyName || "____________");
-  const constitution = "Individual (Hindu)";
+  // Never assert a constitution the source does not support: an entity marker in
+  // the recitals is the only thing that distinguishes a company/LLP from an
+  // individual owner. Everything else is left for the Advocate to confirm.
+  const constitution = has(/એલએલપી|\bLLP\b|પ્રા\.?\s*લિ\.?|પ્રાઇવેટ\s*લિમિટેડ|લિમિટેડ|કંપની|ટ્રસ્ટ/, text)
+    ? "Company / LLP (as recorded in the source)"
+    : "Individual (as recorded in the source)";
 
   let owner = first(/ખરીદનાર[^(\n]*\(([\u0A80-\u0AFF][\u0A80-\u0AFF ]*)\)/, text);
   if (!owner) owner = first(/લખાવી લેનાર[^(\n]*\(([\u0A80-\u0AFF][\u0A80-\u0AFF ]*)\)/, text);
@@ -207,24 +249,31 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
     first(/(સુલેમાન(?:\s+[\u0A80-\u0AFF]{2,20}){1,2})/, text) || "";
   const partitionOwner = partitionOwnerRaw
     ? partitionOwnerRaw.replace(/(?:નાં|ની|નો|ને|નું|ના)$/, "")
-    : "Suleman Mahamad Panchbhaya";
+    : "";
 
-  const village = first(/ગામનું નામ\s*[:ઃ]?\s*([\u0A80-\u0AFF]+)/, text) || "____________";
-  const district = has(/સુરત/, text) ? "Surat" : "____________";
-  const taluka = has(/માંગરોલ/, text) ? "Mangrol" : "____________";
+  // Missing facts stay missing. A hard-coded fallback here would print another
+  // deed's survey number, area or consideration into this report.
+  const village = first(/ગામનું નામ\s*[:ઃ]?\s*([\u0A80-\u0AFF]+)/, text) || "";
+  const district = has(/સુરત/, text) ? "Surat" : "";
+  const taluka = has(/માંગરોલ/, text) ? "Mangrol" : "";
 
-  const rsn = first(/રે\.?\s*સ\.?\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text) || "____________";
+  const rsn = first(/રે\.?\s*સ\.?\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text);
   const blockMatch = /([0-9]+)\s*\(\s*જુનો\s*\)\s*,\s*([0-9]+)\s*\(\s*નવો\s*\)/.exec(text);
-  const oldBlock = first(/બ્લોક\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text) || "____________";
-  const newBlock = blockMatch ? blockMatch[2] : "____________";
-  const khata = first(/ખાતા\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text) || "____________";
+  const oldBlock = first(/બ્લોક\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text);
+  const newBlock = blockMatch ? blockMatch[2] : "";
+  const khata = first(/ખાતા\s*નં\.?\s*[:ઃ]?\s*([0-9]+)/, text);
   const areaRow = first(/ક્ષેત્રફળ\s*\(\s*ચો\.મી\.\s*\)\s*[:ઃ]?\s*([0-9,]+)/, text);
-  const area = areaRow ? `14,406 Sq. Mtrs` : "____________";
+  const area = areaRow ? `${areaRow} Sq. Mtrs` : "";
   const consideration = maxRupee(text);
-  const stampDuty = has(/86,?200/, text) ? "Rs. 86,200/-" : "____________";
-  const regFee = has(/18,?080/, text) ? "Rs. 18,080/-" : "____________";
-  const appNo = first(/(20231101802815)/, text) || "____________";
-  const appDate = first(/(19\/10\/2023)/, text) || "____________";
+  const stampDutyRow = first(/સ્ટેમ્પ\s*ડ્યુટી[^\n]{0,40}?([0-9][0-9,]*)/, text);
+  const stampDuty = stampDutyRow ? `Rs. ${stampDutyRow}/-` : "";
+  const regFeeRow = first(/નોંધણી\s*ફી[^\n]{0,40}?([0-9][0-9,]*)/, text);
+  const regFee = regFeeRow ? `Rs. ${regFeeRow}/-` : "";
+  const appNo = first(/એપ્લિકેશન\s*નં\.?\s*[:ઃ]?\s*([0-9]{6,})/, text);
+  // The e-Challan date sits on the same printed line as its application number;
+  // taking the first date in the document would date the challan to the deed.
+  const appLine = appNo ? text.split(/\n/).find((l) => l.includes(appNo)) ?? "" : "";
+  const appDate = appLine ? first(/([0-9]{2}\/[0-9]{2}\/[0-9]{4})/, appLine) : "";
 
   const note139 = first(/નોંધ\s*નં\.?\s*[:ઃ]?\s*(139)/, text);
   const note1181 = noteNoForDate("05/07/1983", text);
@@ -235,9 +284,9 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
 
   const regBook = first(/\[?([0-9]+)\s*\]?\s*નંબરની\s*બુકમાં/, text) || "1";
   const regSr = first(/અનુ\.?\s*નં\.?\s*[:ઃ]?\s*([0-9]+\/?[0-9]*)/, text) || "";
-  const regDt1991 = first(/તા\.?\s*(19\/07\/1991)/, text) || "19/07/1991";
-  const deedNo = "9006";
-  const deedDate = first(/(23\/10\/2023|2\d\/10\/2023)/, text) || "23/10/2023";
+  const regDt1991 = first(/તા\.?\s*([0-9]{2}\/[0-9]{2}\/1991)/, text);
+  const deedNo = first(/(?:વેચાણપત્ર|દસ્તાવેજ)\s*નં\.?\s*[:ઃ]?\s*([0-9]{1,8})/, text);
+  const deedDate = first(/(?:વેચાણપત્ર|દસ્તાવેજ)\s*નં\.?[^\n]{0,30}?તા\.?\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})/, text);
 
   const boundaries = extractBoundaries(text);
 
@@ -247,12 +296,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   const heirEn = heir ? translit(heir) : "____________";
   const partitionOwnerEn = translit(partitionOwner);
 
-  const propertyBody =
-    `All that piece and parcel of old-tenure agricultural land bearing Revenue Survey No. ${rsn}, ` +
-    `old Survey/Block No. ${oldBlock} (now renumbered as new Survey/Block No. ${newBlock} after promulgation), ` +
-    `admeasuring ${area}, situate at Village ${translit(village)}, Sub-District ${taluka}, District ${district}, ` +
-    `registered in Khata No. ${khata}, together with all rights, title and interest therein ` +
-    (consideration ? `and sold for a consideration of Rs. ${consideration}/-.` : ".");
+  const propertyBody = describeProperty({ text, rsn, oldBlock, newBlock, area, khata, village, taluka, district, consideration });
 
   const docs: string[] = [];
   docs.push(`Certified Copy of Record of Rights (V.F. No. 6, Sample No. 6) relating to RSN ${rsn} — original ownership of ${originalOwnerEn}.`);
@@ -284,7 +328,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   flow.push(`Then, in a family partition among the said owners, Block No. 501 fell to the share of ${partitionOwnerEn} — mutation dtd. 12/03/1990${note1322 ? ` (Note No. ${note1322})` : ""}, which stands certified.`);
   flow.push(`Then, by a registered Sale Deed registered in the office of the Sub-Registrar, Mangrol in Book No. ${regBook}${regSr ? ` at Sr. No. ${regSr}` : ""} dtd. ${regDt1991}, ${partitionOwnerEn} sold the said land to ${sellerEn} — mutation dtd. 20/08/1991${note1356 ? ` (Note No. ${note1356})` : ""}, which stands certified.`);
   flow.push(`Then, under the Re-Survey/Promulgation Scheme a new record was prepared and Block No. 501 was renumbered as new Block No. 572, admeasuring ${area}, vide record dtd. 28/06/2018${note2546 ? ` (Note No. ${note2546})` : ""}, which stands certified.`);
-  flow.push(`Then, by registered Sale Deed No. ${deedNo} dtd. ${deedDate}, ${sellerEn} sold and conveyed the said property to ${ownerEn} for a consideration of Rs. ${consideration || "17,58,000"}/-.`);
+  flow.push(`Then, by registered Sale Deed No. ${deedNo} dtd. ${deedDate}, ${sellerEn} sold and conveyed the said property to ${ownerEn}${consideration ? ` for a consideration of Rs. ${consideration}/-` : ""}.`);
 
   const search: TcrSearchRow[] = [
     {
@@ -294,7 +338,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
       seller: sellerEn,
       purchaser: ownerEn,
       regn: `No. ${deedNo} dtd. ${deedDate}`,
-      remarks: `Consideration Rs. ${consideration || "17,58,000"}/-`,
+      remarks: consideration ? `Consideration Rs. ${consideration}/-` : "Consideration as recorded in the source",
     },
     {
       year: "2018",
@@ -355,11 +399,13 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
     newBlock,
     khata,
     area,
-    consideration: consideration ? `Rs. ${consideration}/-` : "Rs. 17,58,000/-",
+    consideration: consideration ? `Rs. ${consideration}/-` : "",
     stampDuty,
     regFee,
     appNo,
     appDate,
+    deedNo,
+    deedDate,
     propertyBody,
     originalOwner: originalOwnerEn,
     heir: heirEn,
@@ -375,7 +421,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
 export type TcrItem =
   | { t: "h1"; text: string }
   | { t: "h2"; text: string }
-  | { t: "p"; text: string; bold?: boolean; italic?: boolean; align?: "left" | "center" | "right" | "justify" }
+  | { t: "p"; text: string; bold?: boolean; italic?: boolean; align?: "left" | "center" | "right" | "justify"; size?: number }
   | { t: "bullets"; items: string[] }
   | { t: "borders"; rows: Array<[string, string]> }
   | { t: "table"; header: string[]; rows: string[][] }

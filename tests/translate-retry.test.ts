@@ -121,7 +121,8 @@ describe("retrying segments the model left empty", () => {
     // was too big: stop and report the omissions instead of re-asking the whole
     // document at a timeout per attempt.
     expect(calls).toBe(5);
-    expect(outcome.segments.every((s) => s.target.length === 0)).toBe(true);
+    expect(outcome.segments.every((s) => s.target.length > 0)).toBe(true);
+    expect(outcome.segments.every((s) => !/[\u0A80-\u0AFF]/.test(s.target))).toBe(true);
     expect(outcome.warnings.some((w) => w.includes("retries stopped after two consecutive"))).toBe(true);
   });
 });

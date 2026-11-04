@@ -149,6 +149,16 @@ export const config = {
     repairMaxSegments: envInt("NYD_LLM_REPAIR_SEGMENTS", 48),
     /** Segments per second-opinion request. */
     repairBatchSegments: envInt("NYD_LLM_REPAIR_BATCH", 8),
+    /**
+     * Second-opinion requests in flight at once.
+     *
+     * Defaults to 1: on a single GPU, four concurrent repair requests each run
+     * about four times slower and a local model is more likely to abort into a
+     * repetition loop, which made a real 23-page deed slower (490 s of repair
+     * instead of 168 s). Raise it only when the provider has genuinely parallel
+     * capacity. Answers are always adopted in batch order.
+     */
+    repairConcurrency: envInt("NYD_LLM_REPAIR_CONCURRENCY", 1),
   },
 
   ocr: {
@@ -159,6 +169,15 @@ export const config = {
     /** Rendering DPI used when rasterising a scanned page for OCR. */
     renderDpi: envInt("NYD_RENDER_DPI", 300),
     maxDpi: envInt("NYD_MAX_DPI", 400),
+    /**
+     * Scanned pages rendered and OCR'd at once.
+     *
+     * Rasterising and OCR are CPU/GPU work independent per page, so N pages
+     * finish in roughly 1/N of the wall clock until the OCR engine saturates.
+     * Tesseract spawns a process per page and benefits from several; a shared
+     * PaddleOCR service may prefer fewer. Set 1 to force the sequential path.
+     */
+    concurrency: envInt("NYD_OCR_CONCURRENCY", 2),
   },
 
   pipeline: {
@@ -184,6 +203,20 @@ export const config = {
     queueConcurrency: envInt("NYD_QUEUE_CONCURRENCY", 1),
     /** Hard stop for a single pipeline run, so a stuck model cannot pin a queue slot forever. */
     jobTimeoutMs: envInt("NYD_JOB_TIMEOUT_MS", 3 * 60 * 60 * 1000),
+  },
+
+  advocate: {
+    /**
+     * Letterhead of the advocate/firm that signs the title-clearance report.
+     *
+     * Left blank by default: the report is a draft for a named advocate to sign,
+     * so printing a borrowed letterhead would attribute the opinion to someone
+     * who never saw the file. Set NYD_ADVOCATE_* to fill the masthead.
+     */
+    name: process.env.NYD_ADVOCATE_NAME ?? "",
+    phone: process.env.NYD_ADVOCATE_PHONE ?? "",
+    address: process.env.NYD_ADVOCATE_ADDRESS ?? "",
+    place: process.env.NYD_ADVOCATE_PLACE ?? "",
   },
 
   report: {

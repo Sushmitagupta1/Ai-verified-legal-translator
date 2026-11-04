@@ -522,17 +522,14 @@ export default function DocumentPage({ params }: { params: Promise<{ id: string 
                 </a>
                 {report ? (
                   <>
-                    <a className="btn ghost small" href={`/api/documents/${id}/export/docx`}>
-                      Report .docx
+                    <a className="btn" href={`/api/documents/${id}/export/docx`}>
+                      Title Clearance Report .docx
                     </a>
                     <a className="btn ghost small" href={`/api/documents/${id}/export/pdf`}>
                       Report .pdf
                     </a>
                     <a className="btn ghost small" href={`/api/documents/${id}/export/txt`}>
                       Report .txt
-                    </a>
-                    <a className="btn ghost small" href={`/api/documents/${id}/export/docx?kind=tcr`}>
-                      TCR .docx
                     </a>
                   </>
                 ) : null}

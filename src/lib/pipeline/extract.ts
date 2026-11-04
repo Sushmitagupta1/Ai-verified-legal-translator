@@ -128,11 +128,13 @@ async function extractPdf(buffer: Buffer, warnings: string[]): Promise<ExtractRe
     disableFontFace: true,
   }).promise;
 
-  const pages: PageText[] = [];
-  let textPages = 0;
-  let ocrPages = 0;
+  const pageCount = doc.numPages;
+  const plans: Array<{ pageNumber: number; text: string }> = [];
 
-  for (let p = 1; p <= doc.numPages; p++) {
+  // Read the embedded text layer first and close the PDF handle. Rasterisation
+  // below opens its own handle per page, so it can run concurrently without
+  // sharing pdfjs state with this loop.
+  for (let p = 1; p <= pageCount; p++) {
     const page = await doc.getPage(p);
     const content = await page.getTextContent();
 
@@ -145,46 +147,56 @@ async function extractPdf(buffer: Buffer, warnings: string[]): Promise<ExtractRe
     }
     text = normalizeWhitespace(text);
 
-    // A real Gujarati/Hindi document yields far more than 120 characters per
-    // page. Below that, the text layer is decoration (a scan's ghost layer).
-    if (text.length >= MIN_CHARS_PER_PAGE) {
-      textPages++;
-      pages.push({
-        pageNumber: p,
-        kind: "text",
-        text,
-        confidence: null,
-        engine: null,
-        warnings: [],
-      });
-    } else {
-      const pageWarnings: string[] = [];
-      if (text.length > 0) {
-        pageWarnings.push(
-          `Page ${p} has only ${text.length} embedded characters, which is below the ${MIN_CHARS_PER_PAGE}-character threshold. Treated as a scanned page.`,
-        );
-      }
-      const rendered = await BACKEND.pdf.renderPageToImage(buffer, p, config.ocr.renderDpi);
-      const ocr = await BACKEND.ocr.ocrImage(rendered, "image/png");
-      ocrPages++;
-      pages.push({
-        pageNumber: p,
-        kind: "scanned",
-        text: ocr.text,
-        confidence: ocr.confidence,
-        engine: ocr.engine,
-        warnings: [...pageWarnings, ...ocr.warnings],
-      });
-    }
-
+    plans.push({ pageNumber: p, text });
     page.cleanup?.();
   }
 
   await doc.destroy();
 
+  const pages: PageText[] = new Array(pageCount);
+  let textPages = 0;
+  let ocrPages = 0;
+
+  for (const plan of plans) {
+    // A real Gujarati/Hindi document yields far more than 120 characters per
+    // page. Below that, the text layer is decoration (a scan's ghost layer).
+    if (plan.text.length >= MIN_CHARS_PER_PAGE) {
+      textPages++;
+      pages[plan.pageNumber - 1] = {
+        pageNumber: plan.pageNumber,
+        kind: "text",
+        text: plan.text,
+        confidence: null,
+        engine: null,
+        warnings: [],
+      };
+    }
+  }
+
+  const scanned = plans.filter((plan) => plan.text.length < MIN_CHARS_PER_PAGE);
+  await runPool(scanned, config.ocr.concurrency, async (plan) => {
+    const pageWarnings: string[] = [];
+    if (plan.text.length > 0) {
+      pageWarnings.push(
+        `Page ${plan.pageNumber} has only ${plan.text.length} embedded characters, which is below the ${MIN_CHARS_PER_PAGE}-character threshold. Treated as a scanned page.`,
+      );
+    }
+    const rendered = await BACKEND.pdf.renderPageToImage(buffer, plan.pageNumber, config.ocr.renderDpi);
+    const ocr = await BACKEND.ocr.ocrImage(rendered, "image/png");
+    ocrPages++;
+    pages[plan.pageNumber - 1] = {
+      pageNumber: plan.pageNumber,
+      kind: "scanned",
+      text: ocr.text,
+      confidence: ocr.confidence,
+      engine: ocr.engine,
+      warnings: [...pageWarnings, ...ocr.warnings],
+    };
+  });
+
   if (ocrPages > 0) {
     warnings.push(
-      `${ocrPages} of ${doc.numPages} page(s) were scanned images requiring OCR. OCR output can contain errors that propagate into the translation.`,
+      `${ocrPages} of ${pageCount} page(s) were scanned images requiring OCR. OCR output can contain errors that propagate into the translation.`,
     );
   }
 
@@ -194,12 +206,31 @@ async function extractPdf(buffer: Buffer, warnings: string[]): Promise<ExtractRe
 
   return {
     pages,
-    pageCount: doc.numPages,
+    pageCount,
     kind: "pdf",
     hasEmbeddedText: textPages > 0,
     meanOcrConfidence,
     warnings,
   };
+}
+
+/**
+ * Run `fn` over `items` with at most `limit` in flight, preserving result order
+ * in the output array. A rejected item rejects the whole pool after the
+ * already-running work settles, so a failed OCR page is still a hard error.
+ */
+export async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const workers = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= items.length) return;
+        await fn(items[i] as T);
+      }
+    }),
+  );
 }
 
 async function extractDocx(buffer: Buffer, warnings: string[]): Promise<ExtractResult> {

@@ -182,10 +182,19 @@ export interface RepairOptions {
   maxSegments?: number;
   budgetMs?: number;
   batchSegments?: number;
+  /**
+   * Second-opinion requests allowed in flight at once.
+   *
+   * Requests are prefetched in parallel but their answers are still adopted in
+   * batch order, so duplicate detection and "is this actually better?" checks
+   * see the same document state they would in a sequential run. Defaults to
+   * `config.llm.repairConcurrency` (1, because a single GPU serialises them).
+   */
+  concurrency?: number;
 }
 
 /** Ceiling on one second-opinion request. See the call site for why. */
-const REPAIR_CALL_TIMEOUT_MS = 180_000;
+const REPAIR_CALL_TIMEOUT_MS = 90_000;
 
 export interface TranslateOptions {
   docType: string;
@@ -507,6 +516,20 @@ export async function translateSegments(
     }
   }
 
+  // A target must never reach the report as an empty string. The model can
+  // return the right id with no text (or the pipeline can lose a chunk after
+  // two provider failures), and an empty block then reads as a formatting bug
+  // while the reviewer has no idea what was on the page. Keep whatever Latin
+  // content the source already had; otherwise print an explicit marker. Either
+  // way the segment is English-only and still carries its omission note.
+  const filledByFallback = new Set<number>();
+  for (const seg of out) {
+    if (seg.target.trim()) continue;
+    seg.target = lastResortEnglish(seg.source);
+    seg.notes = [...(seg.notes ?? []), "No English translation was produced; source text preserved."];
+    filledByFallback.add(seg.index);
+  }
+
   // Hard invariant: every input index appears exactly once in the output.
   //
   // All three sources are merged here: model output, passthrough, and
@@ -526,7 +549,9 @@ export async function translateSegments(
   // pushes "" when the model returns the id list with a gap or different
   // numbering. The missing-index check below only catches whole absences, so a
   // document could come back 100% untranslated with no omission warning at all.
-  const presentButEmpty = [...byIndex.values()].filter((s) => !s.target).map((s) => s.index);
+  const presentButEmpty = [...byIndex.values()]
+    .filter((s) => filledByFallback.has(s.index))
+    .map((s) => s.index);
 
   const missing = segments.filter((s) => !byIndex.has(s.index));
   for (const seg of missing) {
@@ -534,7 +559,7 @@ export async function translateSegments(
       index: seg.index,
       blockId: seg.blockId,
       source: seg.source,
-      target: seg.passthrough ? seg.source : "",
+      target: seg.passthrough ? seg.source : lastResortEnglish(seg.source),
       confidence: 0,
       notes: ["OMISSION: the provider returned no translation for this segment."],
     });
@@ -850,6 +875,9 @@ async function repairSuspects(
   const batchSize = Math.max(1, opts.repair?.batchSegments ?? config.llm.repairBatchSegments);
   const deadline = Date.now() + Math.max(0, opts.repair?.budgetMs ?? config.llm.repairBudgetMs);
 
+  const batches: Array<typeof chosen> = [];
+  for (let i = 0; i < chosen.length; i += batchSize) batches.push(chosen.slice(i, i + batchSize));
+
   let calls = 0;
   let corrected = 0;
   let done = 0;
@@ -857,17 +885,30 @@ async function repairSuspects(
   /** Indices the stronger model actually answered a request for. */
   const reasked = new Set<number>();
 
-  for (let i = 0; i < chosen.length; i += batchSize) {
-    const batch = chosen.slice(i, i + batchSize);
-    const remaining = deadline - Date.now();
-    if (remaining < 10_000) {
-      outOfTime = true;
-      break;
-    }
+  // Prefetch the next requests while the current answer is being adopted.
+  // A single GPU serialises them (measured: four in flight made a 23-page
+  // deed's repair slower, 490 s instead of 168 s), so concurrency defaults to 1.
+  // A provider with real parallel capacity can raise it; adoption still happens
+  // strictly by batch index, so `hasOtherSameText` sees the same document state
+  // a sequential run would have seen.
+  const concurrency = Math.max(
+    1,
+    Math.min(batches.length, opts.repair?.concurrency ?? config.llm.repairConcurrency),
+  );
+  const stop = new AbortController();
+  const stopSignal = opts.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
+  type RepairResult =
+    | { ok: true; raw: string }
+    | { ok: false; message: string };
+  const pending = new Map<number, Promise<RepairResult>>();
+  let nextToStart = 0;
+  let launchStopped = false;
 
-    let raw: string;
-    try {
-      raw = await llm.complete(
+  const startBatch = (batchIndex: number): void => {
+    const batch = batches[batchIndex]!;
+    const remaining = deadline - Date.now();
+    const promise = llm
+      .complete(
         [
           { role: "system", content: TRANSLATION_SYSTEM },
           { role: "user", content: buildRepairPrompt(batch, docContext, nameHints, termPlanText) },
@@ -878,22 +919,51 @@ async function repairSuspects(
           // A local model occasionally degenerates into a repetition loop on a
           // batch like this. Without a per-call ceiling, one such answer burned
           // 353 s of a 360 s budget on a real deed and crowded out every other
-          // flagged segment. Typical calls finish in well under a minute.
-          signal: requestSignal(opts.signal, Math.min(remaining, REPAIR_CALL_TIMEOUT_MS)),
+          // flagged segment. Typical calls finish in 30-60 s, so 90 s cuts a
+          // degenerate loop without truncating a healthy answer.
+          signal: requestSignal(stopSignal, Math.min(remaining, REPAIR_CALL_TIMEOUT_MS)),
           maxOutputTokens: Math.min(
             2_048,
             Math.max(768, batch.reduce((n, b) => n + estimateTokens(b.seg.source), 0) * 4),
           ),
         },
-      );
-      calls += 1;
-    } catch (err) {
-      const message = err instanceof Error ? err.message.split("\n")[0].slice(0, 160) : "unknown error";
-      warnings.push(`Second-opinion pass stopped after ${done} segment(s): ${message}`);
-      break;
+      )
+      .then((raw): RepairResult => ({ ok: true, raw }))
+      .catch((err): RepairResult => ({
+        ok: false,
+        message: err instanceof Error ? err.message.split("\n")[0]!.slice(0, 160) : "unknown error",
+      }));
+    pending.set(batchIndex, promise);
+  };
+
+  for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+    // Keep the window full. Once the budget is too small to start another
+    // request, let the already-launched ones finish: each was capped at the
+    // time remaining when it started, so none can outlive the deadline.
+    while (!launchStopped && nextToStart < batches.length && nextToStart < batchIndex + concurrency) {
+      if (deadline - Date.now() < 10_000) {
+        outOfTime = true;
+        launchStopped = true;
+        break;
+      }
+      startBatch(nextToStart);
+      nextToStart += 1;
     }
 
-    const returned = targetsOf(parseJson<RawChunkResponse>(raw));
+    const running = pending.get(batchIndex);
+    if (!running) break;
+    const result = await running;
+    pending.delete(batchIndex);
+
+    if (!result.ok) {
+      warnings.push(`Second-opinion pass stopped after ${done} segment(s): ${result.message}`);
+      stop.abort();
+      break;
+    }
+    calls += 1;
+
+    const batch = batches[batchIndex]!;
+    const returned = targetsOf(parseJson<RawChunkResponse>(result.raw));
     // The prompt prints the real segment ids, but a local model sometimes
     // renumbers the batch 0..n-1 - or 1..n - instead of echoing them. If every
     // id it returned is one we asked about, match by id. Otherwise treat the
@@ -904,7 +974,7 @@ async function repairSuspects(
     const ordered = [...returned.values()];
 
     for (let position = 0; position < batch.length; position += 1) {
-      const item = batch[position];
+      const item = batch[position]!;
       const entry = idsMatch ? returned.get(item.seg.index) : ordered[position];
       const candidate = entry?.target?.trim() ?? "";
       if (!candidate) continue;
@@ -931,7 +1001,7 @@ async function repairSuspects(
       );
     }
 
-    done = Math.min(chosen.length, i + batch.length);
+    done = Math.min(chosen.length, (batchIndex + 1) * batchSize);
     opts.onRepair?.(done, chosen.length);
   }
 
@@ -1122,6 +1192,29 @@ export function restoreClauseLabel(target: string, source: string): string {
 
   const body = target.replace(/^\s*\(?\s*(?:\d{1,3}|[ivxIVX]+|[a-zA-Z])\s*[.)]?\s+/, "");
   return `${label} ${body}`.trim();
+}
+
+export const NO_TRANSLATION_MARKER =
+  "[No English translation could be produced for this passage - verify against the source page]";
+
+/**
+ * English-only text for a segment no translation pass could fill.
+ *
+ * Receipts and stamp impressions are often mostly Latin already; stripping the
+ * Gujarati labels leaves usable registration data instead of an empty block. A
+ * wholly Gujarati passage has nothing to preserve, so it gets an explicit
+ * marker rather than an invented translation.
+ */
+export function lastResortEnglish(source: string): string {
+  const stripped = source
+    .replace(/[\u0900-\u097F\u0A80-\u0AFF]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const words = stripped.match(/[A-Za-z]{2,}/g) ?? [];
+  if (words.length >= 2 && stripped.length >= 12) {
+    return `${stripped} [illegible OCR removed]`;
+  }
+  return NO_TRANSLATION_MARKER;
 }
 
 export function buildChunkPrompt(segments: Segment[], docContext: string, nameHints: string[]): string {

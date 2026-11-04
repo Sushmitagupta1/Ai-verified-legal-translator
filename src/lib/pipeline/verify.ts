@@ -5,6 +5,7 @@ import { VERIFIER_SYSTEM, buildVerifierPrompt } from "../llm/prompts";
 import { parseJson } from "../llm/provider";
 import type { LlmClient } from "../llm/provider";
 import { alignSegments, computeCoverage, namesMatch, type AlignmentResult } from "../verify/alignment";
+import { NO_TRANSLATION_MARKER } from "./translate";
 import {
   ambiguousDateReadings,
   datumsAgree,
@@ -549,8 +550,34 @@ export function verifyStructure(input: VerifyInput): {
     );
   }
 
-  for (const idx of coverage.stuntedBlocks) {
-    const blockId = input.blockIds[idx] ?? "";
+  // A fallback marker keeps the Word/PDF paragraph non-empty, but it is not a
+  // translation. Report it as a coverage failure so the placeholder cannot make
+  // an untranslated page look complete in the mechanical checks.
+  const markerBlocks = new Set(
+    input.translated
+      .filter((s) => s.target.includes(NO_TRANSLATION_MARKER))
+      .map((s) => s.blockId),
+  );
+  for (const blockId of markerBlocks) {
+    const idx = input.blockIds.indexOf(blockId);
+    findings.push(
+      finding({
+        check: "structure.translation_missing",
+        category: "Coverage",
+        severity: "critical",
+        blockId,
+        pageNumber: idx >= 0 ? input.pageNumbers[idx] : undefined,
+        title: `Block ${idx + 1} contains an untranslated passage`,
+        detail:
+          "The provider returned no English for at least one passage in this block. The export preserves the source's Latin text or an explicit marker instead of an empty paragraph, but that passage is still unreviewed.",
+        suggestion: "Translate the marked passage against the source page before certifying the document.",
+        sourceExcerpt: excerpt(idx >= 0 ? (input.sourceTexts[idx] ?? "") : ""),
+        targetExcerpt: excerpt(input.targetByBlock.get(blockId) ?? NO_TRANSLATION_MARKER),
+      }),
+    );
+  }
+
+  for (const idx of coverage.stuntedBlocks) {    const blockId = input.blockIds[idx] ?? "";
     const src = input.sourceTexts[idx] ?? "";
     const tgt = input.targetByBlock.get(blockId) ?? "";
     findings.push(
