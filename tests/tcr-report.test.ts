@@ -61,10 +61,12 @@ function data(overrides: Partial<TcrData> = {}): TcrData {
     consideration: "17,58,000",
     stampDuty: "86,200",
     regFee: "18,080",
-    appNo: "",
-    appDate: "",
+    appNo: "20231101802815",
+    appDate: "19/10/2023",
     deedNo: "9006",
     deedDate: "23/10/2023",
+    priorDeedNo: "1879/1",
+    priorDeedDate: "19/07/1991",
     propertyBody:
       "All that piece and parcel of immovable property bearing Revenue Survey No. 467, old Block No. 501 (now new Block No. 572), admeasuring 14,406 Sq. Mtrs, situate at Village Luvara, Sub-District Mangrol, District Surat, together with all rights, title and interest therein.",
     originalOwner: "Isap Museji Panchbhaya",
@@ -238,6 +240,28 @@ describe("title-clearance report layout", () => {
     expect(annexureText).toContain("વેચનાર:- પ્રતાપભાઇ નરસિંહભાઇ પટેલ");
   });
 
+  it("keeps translation-quality findings out of the property description", () => {
+    const out = items();
+    const sectionText = (start: string, end: string) =>
+      out
+        .slice(indexOfHeading(out, start), indexOfHeading(out, end))
+        .map((i) => (i.t === "p" || i.t === "h2" ? i.text : i.t === "bullets" ? i.items.join("\n") : ""))
+        .join("\n");
+
+    // "Block 44 is much shorter than its source" says nothing about the
+    // boundaries, the parties or the documents. Repeating it under every section
+    // makes the report look defective everywhere and hides the one remark that
+    // does belong there.
+    const property = sectionText("3.  Complete description", "4.  Whether the property");
+    expect(property).not.toContain("Corresponding automated finding");
+    expect(property).not.toContain("much shorter than the source");
+    expect(property).not.toContain("Party name spelling drift");
+
+    // The name drift is about who the parties are, so it annotates paragraph 1.
+    const owner = sectionText("1.  Name of the Owner", "2.  Constitution");
+    expect(owner).toContain("Party name spelling drift");
+  });
+
   it("keeps the English body free of Gujarati; evidence stays in the annexure", () => {
     const text = buildTextExport({ docId: "d-test", fileName: report().fileName, blocks: deedBlocks(), report: report() });
     const body = text.split("ANNEXURE B")[0] ?? "";
@@ -272,6 +296,225 @@ describe("title-clearance report layout", () => {
     }
     // Adjectives that belong to another deed must not leak in either.
     expect(text).not.toContain("old-tenure agricultural land bearing Revenue Survey No.");
+  });
+
+  it("lists the prior sale deed and the present instrument in the documents scrutinised", () => {
+    const out = items();
+    const text = out
+      .slice(indexOfHeading(out, "5.  Documents scrutinised"), indexOfHeading(out, "6.  Whether the chain title deeds"))
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).toContain("Prior registered Sale Deed No. 1879/1 dated 19/07/1991");
+    expect(text).toContain("Registered instrument No. 9006 dated 23/10/2023");
+    expect(text).toContain("Application No. 20231101802815");
+  });
+
+  it("prints mutation entry dates read from Gujarati digits", () => {
+    const out = items();
+    const text = out
+      .slice(indexOfHeading(out, "4.  Whether the property has been mutated"), indexOfHeading(out, "5.  Documents scrutinised"))
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).toContain("Entry No. 139 dated 05/07/1983");
+  });
+
+  it("says when the latest mutation predates the conveyance instead of implying it covers the owner", () => {
+    const out = items();
+    const text = out
+      .slice(indexOfHeading(out, "4.  Whether the property has been mutated"), indexOfHeading(out, "5.  Documents scrutinised"))
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).toContain("Note: the latest revenue entry recited is Record-of-Rights mutation Entry No. 139 dated 05/07/1983");
+    expect(text).toContain("predates the conveyance dated 23/10/2023");
+    expect(text).toContain("in the name of Vipul Peravittambhai Gajera");
+    expect(text).toContain("to be confirmed from the current Record of Rights");
+  });
+
+  it("does not assert a mutation gap when the conveyance date is unknown", () => {
+    const out = items({ data: { deedDate: "" } });
+    const text = out
+      .slice(indexOfHeading(out, "4.  Whether the property has been mutated"), indexOfHeading(out, "5.  Documents scrutinised"))
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).not.toContain("Note: the latest revenue entry");
+  });
+
+  it("keeps a glossary miss out of the property sections and quotes its English term once", () => {
+    const reportWith = report({
+      findings: [
+        {
+          id: "f-term",
+          severity: "major",
+          category: "Terminology",
+          check: "terminology.not_present",
+          location: "Page 5, block b5",
+          title: 'Glossary term "જમીન" missing from the translation',
+          detail: 'Glossary term "જમીન" does not appear in the English output. Expected "Land".',
+          suggestion: "Use Land.",
+          sourceExcerpt: "જમીન",
+          targetExcerpt: "land",
+        },
+      ],
+    });
+    const out = items({ report: reportWith });
+    const property = out
+      .slice(indexOfHeading(out, "3.  Complete description"), indexOfHeading(out, "4.  Whether the property"))
+      .map((i) => (i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(property).not.toContain("Glossary term");
+    const register = out.map((i) => JSON.stringify(i)).join("\n");
+    expect(register).toContain('Glossary term “Land” missing from the translation');
+    expect(register).not.toContain('““Land””');
+  });
+
+  it("uses the chronological flow-of-title narration in paragraph 7", () => {
+    const flow = [
+      "Then, the land bearing RSN 467 was originally owned by Isap Museji Panchbhaya.",
+      "Then, by registered Sale Deed No. 9006 dated 23/10/2023, Pratapbhai Narsinhbhai Patel sold the property to Vipul Parshottambhai Gajera.",
+    ];
+    const out = items({ data: { flow } });
+    const start = indexOfHeading(out, "7.  Narration on flow of title");
+    const end = indexOfHeading(out, "8.  Simple mutation");
+    const text = out
+      .slice(start, end)
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).toContain(flow[0]);
+    expect(text).toContain(flow[1]);
+  });
+
+  it("does not claim a registered instrument is absent when the source simply omits the number", () => {
+    const out = items({ data: { deedNo: "", deedDate: "" } });
+    const text = out
+      .slice(indexOfHeading(out, "8.  Simple mutation"), indexOfHeading(out, "9.  Sanctions"))
+      .map((i) => (i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).not.toContain("No registered instrument number is recited");
+    expect(text).toContain("described at paragraph 5");
+  });
+
+  it("warns about low-OCR pages and keeps their findings out of the adverse summary", () => {
+    const scanned = deedBlocks();
+    scanned[0].pageNumber = 23;
+    scanned[0].meta = { pageConfidence: 0.39 };
+    const reportWith = report({
+      findings: [
+        {
+          id: "f1",
+          severity: "major",
+          category: "Coverage",
+          check: "structure.block_stunted",
+          location: "Page 23, block b1",
+          title: "English output is much shorter than the source",
+          detail: "A page the OCR could not read.",
+          suggestion: "Check the original.",
+          sourceExcerpt: "અસ્પષ્ટ",
+          targetExcerpt: "Short.",
+        },
+        {
+          id: "f2",
+          severity: "critical",
+          category: "Coverage",
+          check: "structure.translation_missing",
+          location: "Page 8, block b8",
+          title: "Block has no English translation",
+          detail: "No English was returned.",
+          suggestion: "Re-translate.",
+          sourceExcerpt: "મૂળ",
+          targetExcerpt: "",
+        },
+      ],
+    });
+    const out = items({ blocks: scanned, report: reportWith });
+    const start = indexOfHeading(out, "18.  Adverse remarks on title");
+    const end = indexOfHeading(out, "19.  Documents to be deposited");
+    const text = out
+      .slice(start, end)
+      .map((i) => (i.t === "bullets" ? i.items.join("\n") : i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).toContain("low OCR confidence");
+    expect(text).toContain("page 23");
+    expect(text).toContain("Block has no English translation");
+    expect(text).not.toContain("English output is much shorter than the source");
+  });
+
+  it("does not quote evidence from a low-confidence page", () => {
+    const scanned = deedBlocks();
+    scanned[0].pageNumber = 23;
+    scanned[0].meta = { pageConfidence: 0.39 };
+    scanned[0].targetText = "Posssession was handed over on 03/10/2023 under this fabricated recital.";
+    const out = items({ blocks: scanned });
+    const start = indexOfHeading(out, "6.  Whether the chain title deeds");
+    const end = indexOfHeading(out, "7.  Narration on flow of title");
+    const text = out
+      .slice(start, end)
+      .map((i) => (i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).not.toContain("Posssession was handed over");
+  });
+
+  it("does not quote OCR noise as evidence even on a readable page", () => {
+    const noisy = [
+      block(
+        "body",
+        "જમીન પર કોઈ બોજો નથી.",
+        "The land Xe *? AOAL charge or bond there is none in the case of mortgage. The land is not encumbered by any mortgage.",
+      ),
+    ];
+    noisy[0].meta = { pageConfidence: 0.9 };
+    const out = items({ blocks: noisy });
+    const start = indexOfHeading(out, "14.  Certificate on search reports");
+    const end = indexOfHeading(out, "15.  Type of mortgage");
+    const text = out
+      .slice(start, end)
+      .map((i) => (i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).not.toContain("Xe *? AOAL");
+    expect(text).toContain("not encumbered by any mortgage");
+  });
+
+  it("does not read a power to mortgage as an existing encumbrance", () => {
+    const blocks = [
+      block(
+        "body",
+        "પ્રથમ પક્ષ વેચી, ગીરો મૂકી શકે છે.",
+        "The first party may sell, mortgage, lease or otherwise dispose of the property. The land is not encumbered by any mortgage.",
+      ),
+    ];
+    blocks[0].meta = { pageConfidence: 0.9 };
+    const out = items({ blocks });
+    const start = indexOfHeading(out, "14.  Certificate on search reports");
+    const end = indexOfHeading(out, "15.  Type of mortgage");
+    const text = out
+      .slice(start, end)
+      .map((i) => (i.t === "p" ? i.text : ""))
+      .join("\n");
+    expect(text).not.toContain("may sell, mortgage");
+    expect(text).toContain("not encumbered by any mortgage");
+  });
+
+  it("keeps finding titles free of Gujarati while Annexure B retains evidence", () => {
+    const reportWith = report({
+      findings: [
+        {
+          id: "f1",
+          severity: "critical",
+          category: "Names",
+          check: "datum.name_spelling_drift",
+          location: "Page 1, block b1",
+          title: "નામ spelling drift",
+          detail: "The name is spelled two ways.",
+          suggestion: "Confirm the spelling.",
+          sourceExcerpt: "વેચનાર:- પ્રતાપભાઇ નરસિંહભાઇ પટેલ",
+          targetExcerpt: "Seller: Pratapbhai Narsinhbhai Patel.",
+        },
+      ],
+    });
+    const text = buildTextExport({ docId: "d-test", fileName: report().fileName, blocks: deedBlocks(), report: reportWith });
+    const body = text.split("ANNEXURE B")[0] ?? "";
+    expect(body).not.toMatch(GUJARATI);
+    expect(body).toContain("spelling drift");
+    expect(text.split("ANNEXURE B")[1] ?? "").toMatch(GUJARATI);
   });
 
   it("reports a draft as a draft", () => {

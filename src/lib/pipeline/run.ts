@@ -12,6 +12,7 @@ import { describeBackends } from "./backends";
 import { extractFromBuffer, prepare, type ExtractResult, type PageText } from "./extract";
 import { buildReport, deterministicNarrative, generateNarrative, type ReportInput, type VerificationReport } from "./report";
 import { buildSegments, translateSegments, type Segment, type TranslatedSegment } from "./translate";
+import { normalizeEnglishTarget } from "./englishNormalize";
 import {
   finalizeVerification,
   pendingJudge,
@@ -776,18 +777,25 @@ export function loadBlocks(documentId: string): Block[] {
     translation_state: string; token_count: number; meta: string; confidence: number | null;
   }>("SELECT * FROM blocks WHERE document_id = ? ORDER BY ordinal", documentId);
 
-  return rows.map((r) => ({
-    id: unprefixId(documentId, r.id),
-    ordinal: r.ordinal,
-    pageNumber: r.page_number,
-    kind: r.kind as Block["kind"],
-    sourceText: r.source_text,
-    targetText: r.target_text,
-    translationState: r.translation_state as Block["translationState"],
-    tokenCount: r.token_count,
-    meta: safeJson(r.meta),
-    confidence: r.confidence ?? undefined,
-  }));
+  return rows.map((r) => {
+    const meta = safeJson(r.meta);
+    return {
+      id: unprefixId(documentId, r.id),
+      ordinal: r.ordinal,
+      pageNumber: r.page_number,
+      kind: r.kind as Block["kind"],
+      sourceText: r.source_text,
+      // Read-time correction keeps documents translated before the deterministic
+      // normaliser existed consistent with newly translated ones.
+      targetText: normalizeEnglishTarget(r.target_text, r.source_text, {
+        pageConfidence: typeof meta.pageConfidence === "number" ? meta.pageConfidence : null,
+      }),
+      translationState: r.translation_state as Block["translationState"],
+      tokenCount: r.token_count,
+      meta,
+      confidence: r.confidence ?? undefined,
+    };
+  });
 }
 
 /**
@@ -804,15 +812,27 @@ export function loadTranslation(documentId: string): TranslatedSegment[] {
     id: string;
     block_id: string;
     idx: number;
+    page_number: number;
     source_text: string;
     target_text: string;
     state: string;
     confidence: number | null;
     locked: number;
   }>(
-    "SELECT id, block_id, idx, source_text, target_text, state, confidence, locked FROM segments WHERE document_id = ? ORDER BY idx",
+    "SELECT id, block_id, idx, page_number, source_text, target_text, state, confidence, locked FROM segments WHERE document_id = ? ORDER BY idx",
     documentId,
   );
+
+  const pageConfidence = new Map<number, number | undefined>();
+  for (const b of all<{ page_number: number; meta: string }>(
+    "SELECT page_number, meta FROM blocks WHERE document_id = ? ORDER BY ordinal",
+    documentId,
+  )) {
+    const meta = safeJson(b.meta) as { pageConfidence?: number } | null;
+    if (meta?.pageConfidence != null && !pageConfidence.has(b.page_number)) {
+      pageConfidence.set(b.page_number, meta.pageConfidence);
+    }
+  }
 
   if (rows.length > 0) {
     // block_id is stored namespaced; un-prefix it so it joins to loadBlocks.
@@ -820,7 +840,9 @@ export function loadTranslation(documentId: string): TranslatedSegment[] {
       index: r.idx,
       blockId: unprefixId(documentId, r.block_id),
       source: r.source_text,
-      target: r.target_text,
+      target: normalizeEnglishTarget(r.target_text, r.source_text, {
+        pageConfidence: pageConfidence.get(r.page_number),
+      }),
       confidence: r.confidence ?? 1,
       locked: r.locked === 1,
     }));
@@ -834,7 +856,7 @@ export function loadTranslation(documentId: string): TranslatedSegment[] {
     index: i,
     blockId: unprefixId(documentId, r.id),
     source: r.source_text,
-    target: r.target_text,
+    target: normalizeEnglishTarget(r.target_text, r.source_text),
     confidence: 1,
   }));
 }

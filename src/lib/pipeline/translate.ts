@@ -12,6 +12,7 @@ import { TRANSLATION_SYSTEM, buildUserPrompt } from "../llm/prompts";
 import { parseJson, requestSignal, LlmError } from "../llm/provider";
 import type { LlmClient } from "../llm/provider";
 import { buildTermPlan, formatTermPlanForPrompt, findTerms, type TermOccurrence } from "../verify/terminology";
+import { normalizeEnglishTarget } from "./englishNormalize";
 
 export interface Segment {
   /** Index within the whole document; this is the alignment key. */
@@ -22,6 +23,8 @@ export interface Segment {
   source: string;
   kind: BlockKind;
   pageNumber: number;
+  /** Page-level OCR confidence, used to flag invented facts on unreadable pages. */
+  pageConfidence?: number;
   /** True when the source is English and must be carried through untranslated. */
   passthrough?: boolean;
   termHits: TermOccurrence[];
@@ -126,6 +129,7 @@ function mkSegment(
     source: text,
     kind: block.kind,
     pageNumber: block.pageNumber,
+    pageConfidence: block.meta.pageConfidence,
     passthrough,
     termHits: findTerms(text),
   };
@@ -573,6 +577,17 @@ export async function translateSegments(
       `${presentButEmpty.length} segment(s) came back with empty English text (index ${shown}${more}). ` +
         "The model returned ids the pipeline could not match, so these are untranslated rather than verified.",
     );
+  }
+
+  // Deterministic last-mile corrections, grounded in the Gujarati source:
+  // amount words, protected spellings, assessment-vs-area, revenue entries, and
+  // invented dates on pages the OCR could not read. Applied after every model
+  // pass so a second opinion cannot undo them.
+  const confidenceByIndex = new Map(segments.map((s) => [s.index, s.pageConfidence] as const));
+  for (const seg of byIndex.values()) {
+    seg.target = normalizeEnglishTarget(seg.target, seg.source, {
+      pageConfidence: confidenceByIndex.get(seg.index),
+    });
   }
 
   return {

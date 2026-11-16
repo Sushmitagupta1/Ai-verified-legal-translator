@@ -39,6 +39,19 @@ describe("currency conservation", () => {
     const r = datumsAgree(datum("currency", "500000"), datum("currency", "50000"));
     expect(r.agree).toBe(false);
   });
+
+  it("reads an amount written as 17,58,000/- as currency even without Rs.", () => {
+    // Indian sale-deed tables put "Rs." in the column heading and repeat the
+    // figure with the /- suffix. Treating that row as a plain number made the
+    // verifier report the consideration as missing from the translation.
+    const src = extractAllDatums("રકમ ૧૭,૫૮,૦૦૦/-").find((d) => d.kind === "currency");
+    const tgt = extractAllDatums("HDFC Bank 23/10/2023 800002 17,58,000/-").find(
+      (d) => d.kind === "currency",
+    );
+    expect(src?.normalized).toBe("1758000");
+    expect(tgt?.normalized).toBe("1758000");
+    expect(datumsAgree(src!, tgt!).agree).toBe(true);
+  });
 });
 
 describe("section references", () => {

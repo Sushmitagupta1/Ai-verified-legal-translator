@@ -1,6 +1,7 @@
 import type { Block } from "../domain";
 import { config } from "../config";
 import { toAsciiDigits } from "../domain/gujarati";
+import { LOW_OCR_CONFIDENCE } from "./englishNormalize";
 import type { VerificationReport } from "./report";
 import type { TcrData, TcrItem } from "./tcr";
 
@@ -54,15 +55,50 @@ function orMissing(value: string | undefined | null): string {
   return present(value) ? value.trim() : MISSING;
 }
 
+/** Page-level OCR confidence, taking the worst block on a page. */
+function pageConfidenceMap(blocks: Block[]): Map<number, number> {
+  const map = new Map<number, number>();
+  for (const b of blocks) {
+    const c = b.meta?.pageConfidence;
+    if (typeof c !== "number" || !Number.isFinite(c)) continue;
+    const existing = map.get(b.pageNumber);
+    map.set(b.pageNumber, existing == null ? c : Math.min(existing, c));
+  }
+  return map;
+}
+
+/**
+ * True when an English sentence is too damaged to quote as evidence.
+ *
+ * OCR noise on a badly scanned page reaches the model as plausible-looking
+ * prose, but it is not the document's wording. Quoting it in a legal report
+ * would present a transcription error as the source's own language.
+ */
+function looksLikeOcrGarbage(s: string): boolean {
+  if (/[\u0A80-\u0AFF\u0900-\u097F]/.test(s)) return true;
+  // Asterisks and pipes are not punctuation this deed uses. They are what the
+  // model emits when it tries to render a smudged glyph, e.g. "Xe *? AOAL
+  // charge", which otherwise reads as plausible legal prose.
+  if (/[*|]/.test(s)) return true;
+  const letters = (s.match(/[A-Za-z]/g) ?? []).length;
+  if (letters < 12) return true;
+  const noise = (s.match(/[^A-Za-z0-9\s.,;:'"“”()\[\]\/&%₹$—–-]/g) ?? []).length;
+  return noise / s.length > 0.12;
+}
+
 /** English sentences available for grounding a section, with their page. */
 function englishSentences(blocks: Block[]): Array<{ page: number; text: string }> {
   const out: Array<{ page: number; text: string }> = [];
+  const confidence = pageConfidenceMap(blocks);
   for (const b of blocks) {
+    const pageConf = confidence.get(b.pageNumber);
+    // A page the OCR could barely read is summarised, never quoted.
+    if (pageConf != null && pageConf < LOW_OCR_CONFIDENCE) continue;
     const text = (b.targetText ?? "").replace(/\s+/g, " ").trim();
     if (!text) continue;
     for (const sentence of text.split(/(?<=[.;])\s+(?=[A-Z0-9“"(])/)) {
       const s = sentence.trim();
-      if (s.length >= 12) out.push({ page: b.pageNumber, text: s });
+      if (s.length >= 12 && !looksLikeOcrGarbage(s)) out.push({ page: b.pageNumber, text: s });
     }
   }
   return out;
@@ -90,21 +126,27 @@ function evidence(sentences: Array<{ page: number; text: string }>, re: RegExp, 
 }
 
 function mutationEntries(blocks: Block[]): string[] {
-  const text = blocks
-    .slice()
-    .sort((a, b) => a.ordinal - b.ordinal)
-    .map((b) => b.sourceText ?? "")
-    .join("\n");
+  const text = toAsciiDigits(
+    blocks
+      .slice()
+      .sort((a, b) => a.ordinal - b.ordinal)
+      .map((b) => b.sourceText ?? "")
+      .join("\n"),
+  );
   const out: string[] = [];
   const seen = new Set<string>();
   // "નોંધ નં.139", "નોંધ તં.1181" and OCR variants such as "નોંધ નં.ર546"
   // all label the same revenue entry; the leading "ર" is a misread "2".
-  const re = /નોંધ\s*(?:નં|તં|સં)\.?\s*[:ઃ]?\s*([0-9\u0A80-\u0AFF]{2,6})[^\n]{0,40}?(?:તા\.?\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4}))?/g;
+  const re = /નોંધ\s*(?:નં|તં|સં)\.?\s*[:ઃ]?\s*([0-9\u0A80-\u0AFF]{2,6})/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const raw = (m[1] ?? "").replace(/^ર/, "2");
     const entry = toAsciiDigits(raw).replace(/[^0-9]/g, "");
-    const date = m[2];
+    // The date follows the entry number on the same line; read it from the tail
+    // rather than making the date part of the entry match, which would let the
+    // lazy quantifier stop before it.
+    const tail = text.slice(m.index + m[0].length, m.index + m[0].length + 90);
+    const date = /\b([0-9]{2}\/[0-9]{2}\/[0-9]{4})\b/.exec(tail)?.[1];
     if (!entry) continue;
     const key = `${entry}|${date ?? ""}`;
     if (seen.has(key)) continue;
@@ -115,23 +157,193 @@ function mutationEntries(blocks: Block[]): string[] {
   return out;
 }
 
+/**
+ * Parse a dd/mm/yyyy date into a comparable time, or null when the string has
+ * none. Used only to order revenue entries against the conveyance date.
+ */
+function dmyTime(s: string): number | null {
+  const m = /\b([0-9]{2})\/([0-9]{2})\/([0-9]{4})\b/.exec(s);
+  if (!m) return null;
+  return Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+}
+
+/**
+ * Attach a finding to the sections whose facts it actually touches.
+ *
+ * Category alone is too coarse: a "Data fidelity" finding about the survey
+ * number belongs under the property description, while one about stamp duty
+ * belongs under the documents and the title certificate. Matching the finding's
+ * own words against the vocabulary of each section is deliberately simple and
+ * auditable — a reviewer can see why a remark appears where it does.
+ */
 function sectionsForFinding(f: Finding): number[] {
-  switch (f.category) {
-    case "Names":
-      return [1, 18];
-    case "Dates":
-      return [3, 18];
-    case "Data fidelity":
-      return [3, 4, 18];
-    case "Coverage":
-      return [5, 18];
-    case "Terminology":
-      return [18];
-    case "Semantic fidelity":
-      return [18];
-    default:
-      return [18];
+  // A glossary miss says the English chose a synonym, not that a section's fact
+  // is wrong. It belongs in the register (and Annexure B), not beside the
+  // property description where it reads as a title defect.
+  if (f.check.startsWith("terminology.") || f.check.startsWith("term.")) return [18];
+
+  // Structural and meaning-level findings are statements about the translation
+  // as a whole ("this block is short", "this passage is untranslated"), not
+  // about the property, the parties or the documents. Annotating paragraph 3
+  // with "Block 44 is much shorter than its source" tells the reader nothing
+  // about the boundaries and makes every section look defective.
+  if (
+    f.check.startsWith("structure.") ||
+    f.check.startsWith("coverage.") ||
+    f.check.startsWith("semantic.")
+  ) {
+    return [18];
   }
+
+  // Match the finding's own claim, not its quoted evidence: an excerpt in a
+  // property block mentions "land", so including excerpts attached every
+  // finding on that page to the property description.
+  const text = `${f.title} ${f.detail}`;
+  const out = new Set<number>();
+
+  const property = /\b(survey|block|khata|rsn|area|sq\.?\s*m|hectare|boundar|north|south|east|west|property|plot|parcel|land)\b/i.test(text);
+  const owner = /\b(owner|seller|purchaser|vendee|vendor|heir|partition|name|executant|transferor|transferee)\b/i.test(text);
+  const mutation = /\b(mutation|entry|note no|record of rights|ror|v\.?f\.?|khata)\b/i.test(text);
+  const money = /\b(stamp|registration fee|consideration|challan|payment|amount|rs\.?|rupee|market value)\b/i.test(text);
+  const document = /\b(deed|instrument|document|registered|sub-registrar|application|index|search report|encumbrance)\b/i.test(text);
+  const possession = /\b(possession|handed over|delivered|occupied)\b/i.test(text);
+  const encumbrance = /\b(encumbrance|mortgage|charge|lien|search report|EC)\b/i.test(text);
+
+  if (property) {
+    out.add(3);
+    out.add(4);
+  }
+  if (owner) {
+    out.add(1);
+    out.add(7);
+  }
+  if (mutation) {
+    out.add(4);
+    out.add(7);
+  }
+  if (money) {
+    out.add(5);
+    out.add(16);
+    out.add(19);
+    out.add(21);
+  }
+  if (document) {
+    out.add(5);
+    out.add(19);
+  }
+  if (possession) out.add(6);
+  if (encumbrance) out.add(14);
+
+  out.add(18);
+  return [...out].sort((a, b) => a - b);
+}
+
+function pageOfFinding(f: Finding): number | undefined {
+  const m = /\bPage\s+(\d+)\b/i.exec(f.location);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Paragraph 18 is curated, not a dump of the machine register.
+ *
+ * The verification raises hundreds of number-difference findings on this deed,
+ * most of them OCR artefacts. They stay in Annexure B. Paragraph 18 carries only
+ * the remarks that can affect title or that warn the Advocate that a page was
+ * unreadable, so the section remains a legal summary rather than a log.
+ */
+function isCuratedAdverse(f: Finding, d: TcrData, confidence: Map<number, number>): boolean {
+  const page = pageOfFinding(f);
+  const pageConf = page != null ? confidence.get(page) : undefined;
+  const readablePage = pageConf == null || pageConf >= 0.7;
+  const serious = f.severity === "critical" || f.severity === "major";
+
+  switch (f.check) {
+    case "structure.translation_missing":
+      return true;
+    case "structure.block_stunted":
+    case "semantic.omission":
+    case "semantic.scope":
+      return serious && readablePage;
+    case "terminology.not_present":
+      return f.severity === "critical";
+    case "datum.name_spelling_drift":
+      return true;
+    case "datum.currency_missing":
+    case "datum.currency_changed": {
+      // Money is worth a place at paragraph 18 only when the amount is the
+      // consideration, stamp duty or registration fee itself. A stray "Rs. 23"
+      // from an OCR-mangled receipt line is not a title remark.
+      if (!serious || !readablePage) return false;
+      const money = [d.consideration, d.stampDuty, d.regFee]
+        .filter(present)
+        .map((v) => v.replace(/[^0-9]/g, ""))
+        .filter((v) => v.length >= 3);
+      const numbers = (f.title.match(/\d[\d,]*/g) ?? []).map((x) => x.replace(/,/g, ""));
+      return money.some((m) => numbers.includes(m));
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * Keep the per-section annotations to findings a reader can act on in that
+ * section. The numeric/date register is exhaustive in Annexure B; repeating 200
+ * OCR number differences under paragraph 3 buries the three that matter.
+ */
+function isMaterialForSection(f: Finding): boolean {
+  // Name drift changes who the parties are and belongs beside the owner and
+  // title narration. The remaining datum checks are exhaustive in Annexure B
+  // and, on a scanned deed, mostly OCR number noise.
+  if (f.check === "datum.name_spelling_drift") return true;
+  if (f.check.startsWith("datum.")) return false;
+  return true;
+}
+
+function humanizeCheck(check: string): string {
+  return check
+    .replace(/^[a-z]+\./, "")
+    .replace(/[._]/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Strip Gujarati from a finding's prose, keeping the evidence fields untouched. */
+function findingTitle(f: Finding): string {
+  // A glossary finding names the Gujarati term and, in its detail, the English
+  // equivalent the checker expected. Prefer that English term over a bare
+  // "[Gujarati]" so paragraph 18 stays readable.
+  const expected = /Expected\s+["“]([^"”]+)["”]/i.exec(f.detail)?.[1]?.trim();
+  let sanitized = f.title
+    .replace(/[“"]\s*[\u0A80-\u0AFF]+\s*[”"]/g, expected ? `“${expected}”` : "")
+    .replace(/[\u0A80-\u0AFF]+/g, "[Gujarati]")
+    .replace(/\s+/g, " ")
+    .replace(/^\[Gujarati\]\s*/, "")
+    .trim();
+  if (expected) sanitized = sanitized.replace(/\[Gujarati\]/g, `“${expected}”`);
+  return /[A-Za-z]{3,}/.test(sanitized) ? sanitized : humanizeCheck(f.check);
+}
+
+function englishProse(text: string): string {
+  return text.replace(/[\u0A80-\u0AFF]+/g, "[Gujarati]").replace(/\s+/g, " ").trim();
+}
+
+/** Group page numbers into readable ranges: 15–17, 21, 23. */
+function pageRanges(pages: number[]): string {
+  const sorted = [...new Set(pages)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (const page of sorted.slice(1)) {
+    if (page === prev + 1) {
+      prev = page;
+      continue;
+    }
+    parts.push(start === prev ? `${start}` : `${start}–${prev}`);
+    start = page;
+    prev = page;
+  }
+  if (start != null) parts.push(start === prev ? `${start}` : `${start}–${prev}`);
+  return parts.join(", ");
 }
 
 function severityRank(s: string): number {
@@ -169,9 +381,15 @@ function sectionHead(text: string): string {
 export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
   const { data: d, report: r, blocks } = input;
   const sentences = englishSentences(blocks);
+  const confidence = pageConfidenceMap(blocks);
+  const lowConfidencePages = [...confidence.entries()]
+    .filter(([, c]) => c < LOW_OCR_CONFIDENCE)
+    .map(([page]) => page)
+    .sort((a, b) => a - b);
   const findings = r.findings;
   const bySection = new Map<number, Finding[]>();
   for (const f of findings) {
+    if (!isMaterialForSection(f)) continue;
     for (const n of sectionsForFinding(f)) {
       const list = bySection.get(n) ?? [];
       list.push(f);
@@ -179,10 +397,17 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
     }
   }
 
-  // Paragraph 18 is the adverse-remarks section: every critical/major finding
-  // belongs there, regardless of which other section it also annotates.
+  // Paragraph 18 is curated: title-relevant remarks plus a warning for pages the
+  // OCR could not read. The full machine register remains Annexure B.
+  const adverseTitles = new Set<string>();
   const adverse = findings
-    .filter((f) => f.severity === "critical" || f.severity === "major")
+    .filter((f) => isCuratedAdverse(f, d, confidence))
+    .filter((f) => {
+      const key = findingTitle(f);
+      if (adverseTitles.has(key)) return false;
+      adverseTitles.add(key);
+      return true;
+    })
     .sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
   bySection.set(18, adverse);
 
@@ -193,6 +418,26 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
   const place = config.advocate.place.trim();
 
   const mutation = mutationEntries(blocks);
+
+  // Paragraph 4 asks specifically whether the owner has been mutated in. On a
+  // fresh conveyance the source often stops at the preceding re-survey entry and
+  // never recites the purchaser's mutation, so the report must say the gap is
+  // there rather than let a list of older entries imply it is covered.
+  const mutationGap = (() => {
+    const deedTime = present(d.deedDate) ? dmyTime(d.deedDate) : null;
+    if (deedTime == null || mutation.length === 0) return "";
+    const dated = mutation
+      .map((m) => ({ m, t: dmyTime(m) }))
+      .filter((x): x is { m: string; t: number } => x.t != null);
+    if (dated.length === 0) return "";
+    const latest = dated.reduce((a, b) => (b.t > a.t ? b : a));
+    if (latest.t >= deedTime) return "";
+    return (
+      `Note: the latest revenue entry recited is ${latest.m.replace(/\.$/, "")}, which predates the conveyance dated ${d.deedDate}. ` +
+      `No entry recording that conveyance${present(d.owner) ? ` in the name of ${d.owner}` : ""} is recited; ` +
+      "whether the purchaser's name has since been mutated is to be confirmed from the current Record of Rights."
+    );
+  })();
   const deedLine = present(d.deedNo)
     ? `Registered instrument No. ${d.deedNo}${present(d.deedDate) ? ` dated ${d.deedDate}` : ""}${
         present(d.priorOwner) ? ` executed by ${d.priorOwner}` : ""
@@ -210,6 +455,19 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
     );
   }
   for (const m of mutation) documents.push(`Certified copy of ${m}`);
+  if (present(d.priorDeedNo) || present(d.priorDeedDate)) {
+    const prior = [
+      present(d.priorDeedNo) ? `No. ${d.priorDeedNo}` : "",
+      present(d.priorDeedDate) ? `dated ${d.priorDeedDate}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    documents.push(
+      `Prior registered Sale Deed${prior ? ` ${prior}` : ""}${
+        present(d.partitionOwner) ? ` executed by ${d.partitionOwner}` : ""
+      }${present(d.priorOwner) ? ` in favour of ${d.priorOwner}` : ""}.`,
+    );
+  }
   if (deedLine) documents.push(deedLine);
   if (present(d.stampDuty) || present(d.regFee) || present(d.appNo)) {
     const ref = present(d.appNo)
@@ -233,7 +491,14 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
   const taxEvidence = evidence(sentences, /\b(property tax|municipal tax|tax receipt|land revenue)\b/i, 2);
   const governmentEvidence = evidence(sentences, /\b(government (?:claim|due)|revenue due|panchayat due)\b/i, 2);
   const minorEvidence = evidence(sentences, /\b(minor|guardian|minority)\b/i, 2);
-  const encumbranceEvidence = evidence(sentences, /\b(encumbrance|charge|mortgage|lien|search report)\b/i, 2);
+  // Only a statement that the property is *free of* an encumbrance belongs
+  // under §14. A powers clause that lets the owner "sell, mortgage, lease" also
+  // contains the word "mortgage" but says nothing about existing charges.
+  const encumbranceEvidence = evidence(
+    sentences,
+    /(?:not|no|none|never|free from|free of|unencumbered)[^.]{0,80}(?:encumbrance|mortgage|charge|lien)|(?:encumbrance|mortgage|charge|lien)[^.]{0,60}(?:none|not|free|clear)/i,
+    2,
+  );
 
   const naEvidence = evidence(sentences, /\b(non-agricultural|N\.A\.|NA order|conversion order)\b/i, 2);
   const agricultural = naEvidence.length
@@ -249,6 +514,7 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
       n: 1,
       heading: "Name of the Owner/Mortgagor",
       body: [orMissing(d.owner)],
+      findings: bySection.get(1),
     },
     {
       n: 2,
@@ -276,7 +542,7 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
       body: mutation.length
         ? ["The source records the following revenue entries in the chain of title:"]
         : ["No mutation entry is recorded in the source, so mutation in the name of the owner is not established by this document alone."],
-      bullets: mutation.length ? mutation : undefined,
+      bullets: mutation.length ? [...mutation, ...(mutationGap ? [mutationGap] : [])] : undefined,
       findings: bySection.get(4),
     },
     {
@@ -299,17 +565,14 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
         "Narration on flow of title including document details in chronological order (title derived through partition, will, gift, court order or out of a larger extent of land to be highlighted)",
       body: [
         "The chronological account below is taken from the recitals of the source and from the English translation verified in this report.",
-        present(d.deedNo) || present(d.owner)
-          ? `By ${deedLine.charAt(0).toLowerCase()}${deedLine.slice(1)}${
-              present(d.consideration) ? ` The consideration recited is ${d.consideration}.` : ""
-            }`
-          : MISSING,
+        present(d.propertyBody) ? `The property is described as: ${d.propertyBody}` : MISSING,
       ],
-      bullets: [
-        ...(present(d.propertyBody) ? [`The property is described as: ${d.propertyBody}`] : []),
-        ...mutation.map((m) => `Revenue record: ${m}`),
-        ...(possessionEvidence.length ? [`Possession / handover: ${possessionEvidence.join(" ")}`] : []),
-      ],
+      bullets: d.flow.length
+        ? d.flow
+        : [
+            ...mutation.map((m) => `Revenue record: ${m}`),
+            ...(deedLine ? [deedLine] : []),
+          ],
       findings: bySection.get(7),
     },
     {
@@ -318,8 +581,9 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
         "Simple mutation as a valid document or not — whether title in favour of the current or any previous owner rests on a simple mutation or notarised/affidavit agreement instead of a registered will, release or probate; compulsory registration of a power of attorney",
       body: [
         present(d.deedNo)
-          ? "The link in the chain recited in the source is a registered instrument, supported by the revenue mutations recorded above. Whether any earlier link rests on a simple mutation alone, or on an unregistered power of attorney, is to be confirmed by the Advocate against the certified Record of Rights and the Sub-Registrar's index."
-          : "No registered instrument number is recited in the source, so the instrument on which the current title rests is not established by this document alone. Whether any link in the chain rests on a simple mutation alone, or on an unregistered power of attorney, is to be confirmed by the Advocate against the certified Record of Rights and the Sub-Registrar's index.",
+          ? `The instrument recited in the source is registered Sale Deed No. ${d.deedNo}${present(d.deedDate) ? ` dated ${d.deedDate}` : ""}, supported by the revenue mutations recorded at paragraph 4.`
+          : "The instrument recited in the source is described at paragraph 5, supported by the revenue mutations recorded at paragraph 4.",
+        "Whether any link in the chain rests on a simple mutation alone, or on an unregistered power of attorney, is to be confirmed by the Advocate against the certified Record of Rights and the Sub-Registrar's index.",
       ],
     },
     {
@@ -375,7 +639,23 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
     {
       n: 16,
       heading: "Description of the inspection receipt issued by the Sub-Registrar (number, date, and the year-wise search report)",
-      body: ["Not available from the source — to be completed by the Advocate from the Sub-Registrar's inspection receipts."],
+      body: [
+        ...(present(d.appNo) || present(d.deedNo)
+          ? [
+              `The source records the registration under ${
+                present(d.deedNo) ? `Sale Deed No. ${d.deedNo}${present(d.deedDate) ? ` dated ${d.deedDate}` : ""}` : "the instrument described at paragraph 5"
+              }${present(d.appNo) ? `, Application No. ${d.appNo}${present(d.appDate) ? ` printed on ${d.appDate}` : ""}` : ""}.`,
+            ]
+          : []),
+        ...(present(d.stampDuty) || present(d.regFee)
+          ? [
+              `Stamp duty${present(d.stampDuty) ? ` of ${d.stampDuty}` : ""}${
+                present(d.regFee) ? ` and registration fee of ${d.regFee}` : ""
+              } are recorded as paid in the e-Challan.`,
+            ]
+          : []),
+        "The Sub-Registrar's inspection receipt and the year-wise search report are not part of the source — to be obtained and completed by the Advocate.",
+      ],
     },
     {
       n: 17,
@@ -386,23 +666,37 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
     {
       n: 18,
       heading: "Adverse remarks on title (if any), as per the guidelines affecting title",
-      body: adverse.length
-        ? [
-            `${adverse.length} critical or major finding(s) arise from the automated verification of the English translation. They are recorded here for the Advocate's decision; they are not findings on title itself.`,
-          ]
-        : [
-            "No critical or major finding arises from the automated verification. This is not a title opinion: the Advocate must still satisfy himself from the originals.",
-          ],
+      body: [
+        ...(adverse.length
+          ? [
+              `${adverse.length} title-relevant remark(s) arise from the automated verification of the English translation. They are recorded here for the Advocate's decision; they are not findings on title itself.`,
+            ]
+          : [
+              "No title-relevant remark arises from the automated verification. This is not a title opinion: the Advocate must still satisfy himself from the originals.",
+            ]),
+        ...(lowConfidencePages.length
+          ? [
+              `${lowConfidencePages.length} source page(s) were read at low OCR confidence (page ${pageRanges(lowConfidencePages)}). Passages from those pages are summarised rather than quoted, and every fact taken from them must be checked against the original before reliance.`,
+            ]
+          : []),
+      ],
       // One line per remark. The sentence-level detail and the recommended
       // action live in the findings register, so repeating them here would
       // double the length of the report without adding anything a reader can
       // act on at paragraph 18.
-      bullets: adverse.length
-        ? adverse.map((f) => {
-            const registerNo = findings.indexOf(f) + 1;
-            return `[${SEVERITY_LABEL[f.severity] ?? f.severity.toUpperCase()}] ${f.title}${present(f.location) ? ` — ${f.location}` : ""} (Annexure B, item ${registerNo}).`;
-          })
-        : undefined,
+      bullets: [
+        ...adverse.map((f) => {
+          const registerNo = findings.indexOf(f) + 1;
+          return `[${SEVERITY_LABEL[f.severity] ?? f.severity.toUpperCase()}] ${findingTitle(f)}${present(f.location) ? ` — ${f.location}` : ""} (Annexure B, item ${registerNo}).`;
+        }),
+        ...(lowConfidencePages.length
+          ? [
+              `[WARNING] Verify pages ${pageRanges(lowConfidencePages)} against the original: the OCR confidence for those pages is below ${Math.round(
+                LOW_OCR_CONFIDENCE * 100,
+              )}%, so the English there may contain a transcription error rather than the source's wording.`,
+            ]
+          : []),
+      ],
     },
     {
       n: 19,
@@ -426,9 +720,15 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
       heading: "Certificate on title & marketability of property",
       body: [
         present(d.owner)
-          ? `THIS IS TO CERTIFY that ${d.owner} is the owner of the property more particularly described in paragraph 3 above, having derived title under the registered instrument recited in this report, and that on the basis of the documents and recitals referred to above the title is clear and marketable and free from encumbrances${
+          ? `THIS IS TO CERTIFY that ${d.owner} is the owner of the property more particularly described in paragraph 3 above, having derived title under ${
+              present(d.deedNo)
+                ? `registered Sale Deed No. ${d.deedNo}${present(d.deedDate) ? ` dated ${d.deedDate}` : ""}`
+                : "the registered instrument recited in this report"
+            }${present(d.stampDuty) ? `, duly stamped (${d.stampDuty})` : ""}${
+              present(d.appNo) ? ` and registered under Application No. ${d.appNo}` : ""
+            }, and that on the basis of the documents and recitals referred to above the title is clear and marketable and free from encumbrances${
               adverse.length
-                ? ", subject to the critical and major findings recorded at paragraph 18 and Annexure B being resolved"
+                ? ", subject to the remarks recorded at paragraph 18 and Annexure B being resolved"
                 : ""
             }.`
           : `THIS IS TO CERTIFY that the owner named in the source is the owner of the property more particularly described in paragraph 3 above, having derived title under the registered instrument recited in this report, subject to the findings recorded at paragraph 18 and Annexure B.`,
@@ -489,7 +789,7 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
         t: "p",
         text: `${label}: ${section.findings.length} — ${section.findings
           .slice(0, 4)
-          .map((f) => `${SEVERITY_LABEL[f.severity] ?? f.severity}: ${f.title}`)
+          .map((f) => `${SEVERITY_LABEL[f.severity] ?? f.severity}: ${findingTitle(f)}`)
           .join("; ")}${section.findings.length > 4 ? "; …" : ""}. See Annexure B.`,
         italic: true,
         size: 18,
@@ -549,12 +849,12 @@ export function buildTcrReportItems(input: TcrReportInput): TcrItem[] {
     findings.forEach((f, i) => {
       items.push({
         t: "p",
-        text: `${i + 1}.  [${SEVERITY_LABEL[f.severity] ?? f.severity.toUpperCase()}]  ${f.title}`,
+        text: `${i + 1}.  [${SEVERITY_LABEL[f.severity] ?? f.severity.toUpperCase()}]  ${findingTitle(f)}`,
         bold: true,
       });
       items.push({ t: "p", text: [f.location, f.category, f.check].filter((v) => present(v)).join(" · "), size: 18 });
-      items.push({ t: "p", text: f.detail, align: "justify" });
-      if (f.suggestion) items.push({ t: "p", text: `Action: ${f.suggestion}`, italic: true });
+      items.push({ t: "p", text: englishProse(f.detail), align: "justify" });
+      if (f.suggestion) items.push({ t: "p", text: `Action: ${englishProse(f.suggestion)}`, italic: true });
       if (f.sourceExcerpt) items.push({ t: "p", text: `Gujarati: ${f.sourceExcerpt}`, size: 17 });
       if (f.targetExcerpt) items.push({ t: "p", text: `English: ${f.targetExcerpt}`, size: 17 });
       items.push({ t: "p", text: "" });

@@ -169,6 +169,50 @@ describe("TCR extraction regressions", () => {
   });
 });
 
+describe("TCR extraction — real OCR identifiers", () => {
+  // Snippets reproduced from the 23-page ScanSnap/Tesseract output of
+  // "Sale Deed no. 9006 Survey no. 572.pdf". They exercise the fallbacks that a
+  // clean fixture cannot: the deed number printed on the e-stamp, the date
+  // written in Gujarati month words, and the amount-in-words pairs.
+  const d = extractTcr(
+    blocks([
+      "દસ્તાવેજ લખાવી લેનાર ::- વિપુલ પરષોત્તમભાઇ ગજેરા MG ૩ I h- 9006 202",
+      "Certificate of Stamp RhGL | ॥ - 9006. IN-GJ640495298974b2V 20 21-Oct-2028 03:08 PM",
+      "તારીખ: 23મી, માહેઃ ઓકટોબર, સને 2023",
+      "સ્ટેમ્પ ડ્યુટી 86,200 (Eighty Six Thousand Two Hundred only)",
+      "નોંધણી ફી રૂ. 18080/-",
+      "અવેજ રૂ. 17,58,000 (Seventeen Lakh Fifty Eight Thousand only)",
+      "Application No (અરજી નંબર) 20231101802815 Printed On (છપાયા તારીખ) 19/10/2023 16:49:09",
+      "તા.19/07/1991 નંબરની બુકમાં અનુ. નં. 1879/1",
+    ]),
+    "BANK"
+  );
+
+  it("reads the deed number from the e-stamp certificate and the cover", () => {
+    expect(d.deedNo).toBe("9006");
+  });
+
+  it("reads the deed date written as a Gujarati month", () => {
+    expect(d.deedDate).toBe("23/10/2023");
+  });
+
+  it("takes stamp duty, not consideration, from the amount/words pairs", () => {
+    expect(d.stampDuty).toBe("Rs. 86,200/-");
+    expect(d.consideration).toBe("Rs. 17,58,000/-");
+    expect(d.regFee).toBe("Rs. 18,080/-");
+  });
+
+  it("reads the e-Challan application number and printed date", () => {
+    expect(d.appNo).toBe("20231101802815");
+    expect(d.appDate).toBe("19/10/2023");
+  });
+
+  it("records the prior registered deed separately from the present deed", () => {
+    expect(d.priorDeedNo).toBe("1879/1");
+    expect(d.priorDeedDate).toBe("19/07/1991");
+  });
+});
+
 describe("TCR item builder", () => {
   const d = extractTcr(
     blocks([

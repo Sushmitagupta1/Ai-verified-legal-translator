@@ -4,13 +4,17 @@ import type { Datum, DatumKind } from "../domain";
 const DIGIT_CLASS = "[0-9૦-૯]";
 
 /**
- * A written number: digit groups separated by commas or spaces, optional decimal part.
+ * A written number: digit groups separated by commas, optional decimal part.
  *
  * Each group must start with a digit, which is what stops `5,00,000` from
  * matching as `5,00` — a trailing separator needs digits after it, so the
  * pattern has to consume whole groups rather than a bounded run.
+ *
+ * Whitespace is deliberately *not* a grouping separator: allowing it merged
+ * adjacent table cells into one absurd number ("2023 800002 17,58,000") and
+ * manufactured number-mismatch findings.
  */
-const NUMBER_SOURCE = String.raw`${DIGIT_CLASS}+(?:[,\s]${DIGIT_CLASS}+)*(?:\.${DIGIT_CLASS}+)?`;
+const NUMBER_SOURCE = String.raw`${DIGIT_CLASS}+(?:,${DIGIT_CLASS}+)*(?:\.${DIGIT_CLASS}+)?`;
 
 /** Numeric value of a run of ASCII and/or Gujarati digits. */
 function digitRunValue(run: string): number {
@@ -70,6 +74,20 @@ const RULES: Rule[] = [
     // `રૂ.`/`રૂપિયા` are included: a Gujarati source almost never writes "Rs.",
     // so without them every Gujarati amount was silently unverified.
     re: new RegExp(String.raw`(?:₹|\bRs\.?\s*|\bINR\s*|\bRupees\s+|રૂ(?:પિયા?)?\.?\s*)${NUMBER_SOURCE}`, "g"),
+    normalize: (m) => {
+      const digits = m[0].match(new RegExp(DIGIT_CLASS, "g"))?.join("") ?? "";
+      return String(digitsToValue(digits));
+    },
+  },
+  {
+    kind: "currency",
+    severity: "critical",
+    // Indian legal writing repeats an amount in a table as `17,58,000/-`, with the
+    // rupee symbol only in the column heading. The `/-` suffix is itself the
+    // currency marker; without this rule the table row verified as a missing amount.
+    // Grouping is comma-only here: allowing whitespace would swallow the cheque
+    // number and date that precede the figure on the same table row.
+    re: new RegExp(String.raw`\b${DIGIT_CLASS}+(?:,${DIGIT_CLASS}+)*(?:\.${DIGIT_CLASS}+)?\s*/-`, "g"),
     normalize: (m) => {
       const digits = m[0].match(new RegExp(DIGIT_CLASS, "g"))?.join("") ?? "";
       return String(digitsToValue(digits));

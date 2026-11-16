@@ -35,6 +35,8 @@ export interface TcrData {
   appDate: string;
   deedNo: string;
   deedDate: string;
+  priorDeedNo: string;
+  priorDeedDate: string;
   propertyBody: string;
   originalOwner: string;
   heir: string;
@@ -112,6 +114,121 @@ function maxRupee(s: string): string {
 
 function has(re: RegExp, s: string): boolean {
   return re.test(s);
+}
+
+/** Group digits the way Indian revenue documents print money: 18,080 / 17,58,000. */
+function indianGroup(value: string): string {
+  const digits = value.replace(/[^0-9]/g, "");
+  if (!digits) return "";
+  const lastThree = digits.slice(-3);
+  const rest = digits.slice(0, -3);
+  return rest ? `${rest.replace(/\B(?=(\d{2})+(?!\d))/g, ",")},${lastThree}` : lastThree;
+}
+
+const MONTH_WORDS: Array<[RegExp, number]> = [
+  [/જાન્યુ/, 1],
+  [/ફેબ્રુ|ફેબ/, 2],
+  [/માર્ચ/, 3],
+  [/એપ્રિલ|એપ્રી/, 4],
+  [/^મે$/, 5],
+  [/જૂન|જુન/, 6],
+  [/જુલાઈ|જુલાઇ|જુલાઈ/, 7],
+  [/ઓગસ્ટ|ઑગસ્ટ/, 8],
+  [/સપ્ટેમ્બર|સપ્ટે/, 9],
+  [/ઓકટોબર|ઓક્ટોબર|ઓક્ટોમ્બર|ઓકટોમ્બર/, 10],
+  [/નવેમ્બર|નવે/, 11],
+  [/ડિસેમ્બર|ડિસે/, 12],
+];
+
+function monthNumber(word: string): number {
+  for (const [re, n] of MONTH_WORDS) if (re.test(word)) return n;
+  return 0;
+}
+
+function pad2(value: string): string {
+  return value.padStart(2, "0");
+}
+
+/**
+ * Read the deed date from the Gujarati recital.
+ *
+ * The deed writes "તારીખ: ૨૩મી, માહેઃ ઓકટોબર, સને ૨૦૨૩" rather than digits, so
+ * a bare DD/MM/YYYY regex misses it. The e-Challan and Sub-Registrar receipts
+ * carry the same date in digits; those are the fallback.
+ */
+function extractDeedDate(text: string): string {
+  const monthRe =
+    /(?:તારીખ|તા\.?)\s*[:ઃ]?\s*([0-9]{1,2})\s*મી\s*[,\s]*(?:માહે\s*[:ઃ]?|મહિનો|માસ)?\s*([\u0A80-\u0AFF]+)\s*[,\s]*(?:સને\s*)?([0-9]{4})/;
+  const monthMatch = monthRe.exec(text);
+  if (monthMatch) {
+    const month = monthNumber(monthMatch[2]);
+    if (month) return `${pad2(monthMatch[1])}/${pad2(String(month))}/${monthMatch[3]}`;
+  }
+
+  const labelled = [
+    ...text.matchAll(/(?:તારીખ|તા\.?)\s*[:ઃ]?\s*([0-9]{1,2})[-\/]([0-9]{1,2})[-\/]([0-9]{2,4})/g),
+  ];
+  if (labelled.length > 0) {
+    const m = labelled[labelled.length - 1];
+    const year = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${pad2(m[1])}/${pad2(m[2])}/${year}`;
+  }
+
+  // Last resort: the sale deed is the most recent 20xx date in the document.
+  const years = [...text.matchAll(/\b([0-9]{1,2})\/([0-9]{1,2})\/(20[0-9]{2})\b/g)];
+  if (years.length > 0) {
+    const m = years[years.length - 1];
+    return `${pad2(m[1])}/${pad2(m[2])}/${m[3]}`;
+  }
+  return "";
+}
+
+/** The registered number printed on the e-stamp certificate or the deed cover. */
+function extractDeedNo(text: string): string {
+  const patterns = [
+    /(?:દસ્તાવેજ|વેચાણપત્ર)\s*નં\.?\s*[:ઃ]?\s*([0-9]{3,8})/,
+    /([0-9]{3,8})\s*નંબરે\s*નોંધ/,
+    /Certificate\s+of\s+Stamp[\s\S]{0,80}?[-–—]\s*([0-9]{3,8})\s*\./i,
+    /અનુક્રમ[^\n]{0,30}?([0-9]{3,8})/,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m) return m[1];
+  }
+  return "";
+}
+
+/**
+ * Extract stamp duty from the English e-stamp certificate, falling back to the
+ * Gujarati "stamp duty Rs. ..." recital.
+ *
+ * The certificate prints the consideration and the stamp duty side by side as
+ * amount + words. Taking the first/largest amount would return consideration,
+ * so the amount equal to consideration and the one worded in lakhs are skipped.
+ */
+function extractStampDuty(text: string, consideration: string): string {
+  const cons = Number(consideration.replace(/[^0-9]/g, ""));
+  const pairs: Array<{ raw: string; n: number; words: string }> = [];
+  const re = /([0-9][0-9,]{2,})\s*(?:[-–—*]\s*)?(?:[a-z]{1,4}[,.]?\s*)?\(([A-Za-z][A-Za-z ]{3,90}?)\s+only\)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const n = Number(m[1].replace(/,/g, ""));
+    if (Number.isFinite(n) && n > 0) pairs.push({ raw: m[1], n, words: m[2] });
+  }
+
+  const candidates = pairs
+    .filter((p) => (!cons || p.n !== cons) && !/\blakh\b/i.test(p.words))
+    .sort((a, b) => a.n - b.n);
+  if (candidates.length > 0) return candidates[0].raw;
+
+  const nonConsideration = pairs
+    .filter((p) => !cons || p.n !== cons)
+    .sort((a, b) => a.n - b.n);
+  if (nonConsideration.length > 0) return nonConsideration[0].raw;
+
+  const gujarati =
+    /(?:સ્ટેમ્પ\s*ડ[^\s]{0,8}ટી|સ્ટેમ્પ\s*ડ્યુટી)[^\n]{0,40}?રૂ\.?\s*([0-9][0-9,]*)/.exec(text);
+  return gujarati ? gujarati[1] : "";
 }
 
 const NOTE_PREFIX_OCR: Record<string, string> = { "ર": "2" };
@@ -265,15 +382,19 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   const areaRow = first(/ક્ષેત્રફળ\s*\(\s*ચો\.મી\.\s*\)\s*[:ઃ]?\s*([0-9,]+)/, text);
   const area = areaRow ? `${areaRow} Sq. Mtrs` : "";
   const consideration = maxRupee(text);
-  const stampDutyRow = first(/સ્ટેમ્પ\s*ડ્યુટી[^\n]{0,40}?([0-9][0-9,]*)/, text);
-  const stampDuty = stampDutyRow ? `Rs. ${stampDutyRow}/-` : "";
+  const stampDutyRow = extractStampDuty(text, consideration);
+  const stampDuty = stampDutyRow ? `Rs. ${indianGroup(stampDutyRow)}/-` : "";
   const regFeeRow = first(/નોંધણી\s*ફી[^\n]{0,40}?([0-9][0-9,]*)/, text);
-  const regFee = regFeeRow ? `Rs. ${regFeeRow}/-` : "";
-  const appNo = first(/એપ્લિકેશન\s*નં\.?\s*[:ઃ]?\s*([0-9]{6,})/, text);
+  const regFee = regFeeRow ? `Rs. ${indianGroup(regFeeRow)}/-` : "";
+  const appNo =
+    first(/Application\s*No[^\n]{0,40}?([0-9]{8,})/i, text) ||
+    first(/એપ્લિકેશન\s*નં\.?\s*[:ઃ]?\s*([0-9]{6,})/, text);
   // The e-Challan date sits on the same printed line as its application number;
   // taking the first date in the document would date the challan to the deed.
   const appLine = appNo ? text.split(/\n/).find((l) => l.includes(appNo)) ?? "" : "";
-  const appDate = appLine ? first(/([0-9]{2}\/[0-9]{2}\/[0-9]{4})/, appLine) : "";
+  const appDate =
+    first(/Printed\s*On[^\n]{0,60}?([0-9]{2}\/[0-9]{2}\/[0-9]{4})/i, text) ||
+    (appLine ? first(/([0-9]{2}\/[0-9]{2}\/[0-9]{4})/, appLine) : "");
 
   const note139 = first(/નોંધ\s*નં\.?\s*[:ઃ]?\s*(139)/, text);
   const note1181 = noteNoForDate("05/07/1983", text);
@@ -285,8 +406,8 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   const regBook = first(/\[?([0-9]+)\s*\]?\s*નંબરની\s*બુકમાં/, text) || "1";
   const regSr = first(/અનુ\.?\s*નં\.?\s*[:ઃ]?\s*([0-9]+\/?[0-9]*)/, text) || "";
   const regDt1991 = first(/તા\.?\s*([0-9]{2}\/[0-9]{2}\/1991)/, text);
-  const deedNo = first(/(?:વેચાણપત્ર|દસ્તાવેજ)\s*નં\.?\s*[:ઃ]?\s*([0-9]{1,8})/, text);
-  const deedDate = first(/(?:વેચાણપત્ર|દસ્તાવેજ)\s*નં\.?[^\n]{0,30}?તા\.?\s*([0-9]{2}\/[0-9]{2}\/[0-9]{4})/, text);
+  const deedNo = extractDeedNo(text);
+  const deedDate = extractDeedDate(text);
 
   const boundaries = extractBoundaries(text);
 
@@ -297,6 +418,15 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   const partitionOwnerEn = translit(partitionOwner);
 
   const propertyBody = describeProperty({ text, rsn, oldBlock, newBlock, area, khata, village, taluka, district, consideration });
+
+  // Join whatever the document actually states. An empty value must collapse
+  // away rather than print "No.  dtd. " into the deliverable.
+  const deedRef = [deedNo ? `No. ${deedNo}` : "", deedDate ? `dtd. ${deedDate}` : ""]
+    .filter(Boolean)
+    .join(" ");
+  const challanRef = [appNo ? `Application No. ${appNo}` : "", appDate ? `printed dtd. ${appDate}` : ""]
+    .filter(Boolean)
+    .join(" ");
 
   const docs: string[] = [];
   docs.push(`Certified Copy of Record of Rights (V.F. No. 6, Sample No. 6) relating to RSN ${rsn} — original ownership of ${originalOwnerEn}.`);
@@ -309,8 +439,18 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   docs.push(`Original Regd. Sale Deed (Book No. ${regBook}${regSr ? `, Sr. No. ${regSr}` : ""}) dtd. ${regDt1991} executed by ${partitionOwnerEn} in favour of ${sellerEn}.`);
   docs.push(`Certified Copy of Record of Rights mutation${note1356 ? `, Note No. ${note1356} dtd. 20/08/1991` : " dtd. 20/08/1991"} — in the name of ${sellerEn} (certified).`);
   docs.push(`Certified Copy of Record of Rights mutation${note2546 ? `, Note No. ${note2546} dtd. 28/06/2018` : " dtd. 28/06/2018"} — Re-Survey/Promulgation; Block No. 501 renumbered as new Block No. 572, area ${area} (certified).`);
-  docs.push(`Original Regd. Sale Deed No. ${deedNo} dtd. ${deedDate} executed by ${sellerEn} in favour of ${ownerEn} with full ownership rights.`);
-  docs.push(`Copy of e-Challan for Stamp Duty & Registration (Application No. ${appNo} printed dtd. ${appDate}) — Stamp Duty ${stampDuty} and Registration Fee ${regFee} paid.`);
+  docs.push(`Original Regd. Sale Deed${deedRef ? ` ${deedRef}` : ""} executed by ${sellerEn} in favour of ${ownerEn} with full ownership rights.`);
+  const paid = [
+    stampDuty ? `Stamp Duty ${stampDuty}` : "",
+    regFee ? `Registration Fee ${regFee}` : "",
+  ]
+    .filter(Boolean)
+    .join(" and ");
+  docs.push(
+    `Copy of e-Challan for Stamp Duty & Registration${challanRef ? ` (${challanRef})` : ""}${
+      paid ? ` — ${paid} paid.` : "."
+    }`,
+  );
 
   const flow: string[] = [];
   if (originalOwnerEn !== "____________") {
@@ -328,7 +468,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
   flow.push(`Then, in a family partition among the said owners, Block No. 501 fell to the share of ${partitionOwnerEn} — mutation dtd. 12/03/1990${note1322 ? ` (Note No. ${note1322})` : ""}, which stands certified.`);
   flow.push(`Then, by a registered Sale Deed registered in the office of the Sub-Registrar, Mangrol in Book No. ${regBook}${regSr ? ` at Sr. No. ${regSr}` : ""} dtd. ${regDt1991}, ${partitionOwnerEn} sold the said land to ${sellerEn} — mutation dtd. 20/08/1991${note1356 ? ` (Note No. ${note1356})` : ""}, which stands certified.`);
   flow.push(`Then, under the Re-Survey/Promulgation Scheme a new record was prepared and Block No. 501 was renumbered as new Block No. 572, admeasuring ${area}, vide record dtd. 28/06/2018${note2546 ? ` (Note No. ${note2546})` : ""}, which stands certified.`);
-  flow.push(`Then, by registered Sale Deed No. ${deedNo} dtd. ${deedDate}, ${sellerEn} sold and conveyed the said property to ${ownerEn}${consideration ? ` for a consideration of Rs. ${consideration}/-` : ""}.`);
+  flow.push(`Then, by registered Sale Deed${deedRef ? ` ${deedRef}` : ""}, ${sellerEn} sold and conveyed the said property to ${ownerEn}${consideration ? ` for a consideration of Rs. ${consideration}/-` : ""}.`);
 
   const search: TcrSearchRow[] = [
     {
@@ -337,7 +477,7 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
       description: `${propertyBody}`,
       seller: sellerEn,
       purchaser: ownerEn,
-      regn: `No. ${deedNo} dtd. ${deedDate}`,
+      regn: deedRef || "Sale deed as described in the source",
       remarks: consideration ? `Consideration Rs. ${consideration}/-` : "Consideration as recorded in the source",
     },
     {
@@ -406,6 +546,8 @@ export function extractTcr(blocks: Block[], companyName: string): TcrData {
     appDate,
     deedNo,
     deedDate,
+    priorDeedNo: regSr,
+    priorDeedDate: regDt1991,
     propertyBody,
     originalOwner: originalOwnerEn,
     heir: heirEn,

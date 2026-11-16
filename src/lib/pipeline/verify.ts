@@ -304,6 +304,18 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
         continue;
       }
 
+      // A deed repeats the consideration in the recital and again in the payment
+      // table. If the same value has already been matched once in this block, a
+      // surplus source occurrence is a dropped repetition, not a missing fact;
+      // reporting it as a critical omission buries the amounts that are absent.
+      const alreadyMatched = pool.some(
+        (c) => c.used && c.datum.kind === sd.kind && c.datum.normalized === sd.normalized,
+      );
+      if (alreadyMatched) {
+        sd.status = "missing";
+        continue;
+      }
+
       sd.status = "missing";
       findings.push(
         finding({

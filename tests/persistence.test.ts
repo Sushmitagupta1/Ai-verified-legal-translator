@@ -232,6 +232,17 @@ describe("currency survives segmentation", () => {
     const { findings } = verify.verifyDatums(input(line, "A fine of Rs. 5,00,000 shall be imposed."));
     expect(findings.filter((f) => f.check === "datum.currency_changed")).toHaveLength(1);
   });
+
+  it("does not call a repeated amount missing when the same value is present in the block", () => {
+    // The deed states the consideration in the recital and twice in the payment
+    // table; the English may carry it once or twice. A surplus source occurrence
+    // is a repetition, not a dropped fact.
+    const source =
+      "વેચાણ અવેજ રૂ. ૧૭,૫૮,૦૦૦/- છે. કોષ્ટકમાં ૧૭,૫૮,૦૦૦/- અને વળી ૧૭,૫૮,૦૦૦/- લખેલ છે.";
+    const target = "The consideration is Rs. 17,58,000/-. The table shows 17,58,000/-.";
+    const { findings } = verify.verifyDatums(input(source, target));
+    expect(findings.filter((f) => f.check === "datum.currency_missing")).toEqual([]);
+  });
 });
 
 describe("finding titles stay readable in English", () => {
