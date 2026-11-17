@@ -228,6 +228,26 @@ describe("currency survives segmentation", () => {
     expect(findings.filter((f) => f.check === "datum.currency_changed")).toEqual([]);
   });
 
+  it("does not call two unrelated dates a change when neither is in the translation", () => {
+    const source = "The heirs were entered on 26/08/1988. The scheme is dated 17/07/1982.";
+    const target = "The entry is dated 15/07/1983 and was confirmed on 14/10/1988.";
+    const { findings, datums } = verify.verifyDatums(input(source, target));
+
+    // There is no pairing that would justify "26/08/1988 changed to
+    // 15/07/1983"; both source dates are simply absent. A change claim here
+    // would present an OCR/translation omission as a different fact.
+    expect(findings.filter((f) => f.check === "datum.date_changed")).toEqual([]);
+    expect(datums.filter((d) => d.status === "changed")).toEqual([]);
+    expect(datums.filter((d) => d.status === "missing")).toHaveLength(2);
+  });
+
+  it("flags a genuine one-to-one date change", () => {
+    const source = "The deed is dated 26/08/1988.";
+    const target = "The deed is dated 14/10/1988.";
+    const { findings } = verify.verifyDatums(input(source, target));
+    expect(findings.filter((f) => f.check === "datum.date_changed")).toHaveLength(1);
+  });
+
   it("flags an English amount that does not match the Gujarati", () => {
     const { findings } = verify.verifyDatums(input(line, "A fine of Rs. 5,00,000 shall be imposed."));
     expect(findings.filter((f) => f.check === "datum.currency_changed")).toHaveLength(1);

@@ -111,4 +111,26 @@ describe("semantic judge coverage", () => {
     expect(half.semantic).toBeLessThan(full.semantic);
     expect(half.total).toBeGreaterThan(none.total);
   });
+
+  it("charges only data findings to data fidelity", () => {
+    const opts = {
+      coverage,
+      judge: judgeResult(),
+      meanOcrConfidence: 0.9,
+      datumCount: 100,
+      termCount: 100,
+    };
+    const finding = (check: string) =>
+      ({ check, severity: "critical", category: "Data fidelity", status: "open" }) as never;
+
+    const structural = scoreVerification([finding("structure.block_stunted")], opts);
+    const data = scoreVerification([finding("datum.number_changed")], opts);
+
+    // The structural finding still affects the grade, but it is not a wrong
+    // datum and must not be counted as one in the labelled "Data fidelity"
+    // component, where it was double-charged against terminology/coverage.
+    expect(structural.datumIntegrity).toBe(1);
+    expect(structural.criticalCount).toBe(1);
+    expect(data.datumIntegrity).toBe(0.99);
+  });
 });

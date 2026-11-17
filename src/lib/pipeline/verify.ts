@@ -121,7 +121,9 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
     const pool = tgtDatums.map((d, idx) => ({ datum: d, idx, used: false }));
 
     for (const sd of srcDatums) {
-      datums.push({ ...sd, status: "matched" });
+      // Keep the same object: every branch below sets `sd.status`, and a copy
+      // would leave the returned datum register claiming everything matched.
+      datums.push(sd);
 
       // Names: compare transliterations, tolerate initials forms.
       if (sd.kind === "person_name" || sd.kind === "party_name") {
@@ -269,11 +271,20 @@ export function verifyDatums(input: VerifyInput): { datums: Datum[]; findings: F
         continue;
       }
 
-      // Changed vs missing: look for a same-kind target datum at roughly the same
-      // spot. "5,00,000 -> 6,00,000" is a changed amount; "Rs." with no digits at
-      // all is a missing one. Both are critical and both must be shown.
+      // Changed vs missing. "5,00,000 -> 6,00,000" is a changed amount; a bare
+      // "Rs." with no digits is a missing one. Both are critical.
+      //
+      // A change can only be attributed when one source datum and one target
+      // datum are left over. A long revenue block carries several dates and
+      // entries; pairing arbitrary leftovers would produce claims such as
+      // "26/08/1988 changed to 05/07/1983" when the translation simply carried
+      // a different set of dates. Where attribution is ambiguous, report the
+      // value as absent instead of inventing a change.
       const sameKind = pool.filter((c) => !c.used && c.datum.kind === sd.kind);
-      const nearby = sameKind[0];
+      const unmatchedSource = srcDatums.filter(
+        (x) => x.kind === sd.kind && (x === sd || x.status !== "matched"),
+      ).length;
+      const nearby = sameKind.length === 1 && unmatchedSource === 1 ? sameKind[0] : undefined;
 
       if (nearby) {
         nearby.used = true;
@@ -1073,12 +1084,16 @@ export function scoreVerification(
   const open = findings.filter((f) => f.status === "open");
   const criticalCount = open.filter((f) => f.severity === "critical").length;
   const majorCount = open.filter((f) => f.severity === "major").length;
-  const minorCount = open.filter((f) => f.severity === "minor").length;
 
+  // Only data-comparison findings belong in the data-fidelity component.
+  // Terminology, coverage and meaning-level findings are already represented in
+  // their own components and in the overall severity grade; charging them here
+  // as well double-counts them and mislabels them as wrong numbers.
+  const datumPenalty = open
+    .filter((f) => f.check.startsWith("datum."))
+    .reduce((a, f) => a + weight(f.severity), 0);
   const datumIntegrity =
-    opts.datumCount === 0
-      ? 1
-      : Math.max(0, 1 - (criticalCount * 1 + majorCount * 0.5 + minorCount * 0.25) / Math.max(1, opts.datumCount));
+    opts.datumCount === 0 ? 1 : Math.max(0, 1 - datumPenalty / Math.max(1, opts.datumCount));
 
   const terminology =
     opts.termCount === 0
